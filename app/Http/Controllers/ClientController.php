@@ -59,7 +59,7 @@ class ClientController extends Controller
 
             if ($driver === 'mysql') {
                 $result = DB::connection('tenant')->select("SHOW TABLES");
-                $tables = array_map(fn($row) => reset((array) $row), $result);
+                $tables = array_map(fn($row) => current((array) $row), $result);
             }
 
             if ($driver === 'sqlite') {

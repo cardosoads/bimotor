@@ -4,11 +4,11 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Client;
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
-use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Str;
 
 class ReceiveDataController extends Controller
@@ -22,11 +22,11 @@ class ReceiveDataController extends Controller
             'payload' => $request->all(),
             'headers' => $request->headers->all()
         ]);
-        Log::info('Recebendo dados brutos:', ['dados' => $request->all()]);
 
         $data = $request->validate([
             'user_identifier' => 'required|string',
             'payload' => 'required|array',
+            'payload.*' => 'array',
         ]);
 
         Log::info('Requisição ReceiveData recebida', [
@@ -59,12 +59,14 @@ class ReceiveDataController extends Controller
         }
 
         try {
-            $connection = DB::connection('tenant');
-            $connection->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, false);
-            $connection->beginTransaction();
+            $conn = DB::connection('tenant');
+            $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, false);
+            $conn->beginTransaction();
             Log::info('Transação iniciada para o tenant', ['database' => $client->database_name]);
 
-            foreach ($data['payload'] as $table => $rows) {
+            foreach ($data['payload'] as $rawTable => $rows) {
+                // Sanitizar nome de tabela
+                $table = $this->sanitizeTableName($rawTable);
                 if (!is_array($rows) || empty($rows)) {
                     Log::info("Ignorando tabela vazia: $table");
                     continue;
@@ -75,8 +77,8 @@ class ReceiveDataController extends Controller
                 Log::info('Processamento da tabela concluído', ['tabela' => $table]);
             }
 
-            $connection->commit();
-            $connection->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
+            $conn->commit();
+            $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
             Log::info('Todos os dados foram sincronizados com sucesso para o cliente', ['client_id' => $client->id]);
 
             return response()->json(['message' => 'Dados sincronizados com sucesso.']);
@@ -110,22 +112,19 @@ class ReceiveDataController extends Controller
         }
 
         $columns = Schema::connection('tenant')->getColumnListing($table);
-        $primaryKey = $this->guessPrimaryKey(array_keys($rows[0]), $table);
+        $primaryKey = $this->guessPrimaryKey($columns, $table);
         $filteredRows = $this->filterRows($rows, $columns, $table, $primaryKey);
 
         $uniqueKey = $this->detectPrimaryKey($table, $columns, $rows[0]);
-
-        // Logar os dados filtrados antes do upsert
-        Log::debug('Dados filtrados para upsert', [
-            'tabela' => $table,
-            'uniqueKey' => $uniqueKey,
-            'filteredRows' => $filteredRows
-        ]);
+        Log::debug('Dados filtrados para upsert', ['tabela' => $table, 'uniqueKey' => $uniqueKey, 'filteredRows' => $filteredRows]);
 
         DB::connection('tenant')->table($table)->upsert(
             $filteredRows,
             is_array($uniqueKey) ? $uniqueKey : [$uniqueKey],
-            array_diff($columns, array_merge((array)$uniqueKey, ['created_at', 'updated_at']))
+            array_diff(
+                $columns,
+                array_merge((array)$uniqueKey, ['created_at', 'updated_at', 'synced_at'])
+            )
         );
 
         Log::info('Upsert realizado na tabela', ['tabela' => $table, 'linhas' => count($filteredRows)]);
@@ -142,33 +141,30 @@ class ReceiveDataController extends Controller
         $columns = array_keys($firstRow);
 
         Schema::connection('tenant')->create($table, function (Blueprint $t) use ($firstRow, $primaryKey, $columns) {
-            if ($primaryKey && in_array($primaryKey, $columns)) {
-                $t->unsignedBigInteger('id')->primary();
-            } else {
-                $t->id();
-            }
-
+            $t->id();
             foreach ($columns as $column) {
-                if ($column === $primaryKey || strtolower($column) === 'id') {
-                    continue;
-                }
+                if ($column === $primaryKey || Str::lower($column) === 'id') continue;
 
                 $value = $firstRow[$column];
-                if (is_int($value)) {
+                if ($this->isBoolean($value)) {
+                    $t->boolean($column)->nullable();
+                } elseif ($this->isDate($value)) {
+                    $t->date($column)->nullable();
+                } elseif ($this->isDateTime($value)) {
+                    $t->dateTime($column)->nullable();
+                } elseif (is_int($value)) {
                     $t->integer($column)->nullable();
                 } elseif (is_float($value)) {
                     $t->float($column)->nullable();
-                } elseif ($this->isDateTime($value)) {
-                    $t->dateTime($column)->nullable();
                 } else {
-                    $t->text($column)->nullable();
+                    $t->string($column, 255)->nullable();
                 }
             }
-
             $t->timestamps();
+            $t->timestamp('synced_at')->nullable();
         });
 
-        Log::info('Nova tabela criada', ['tabela' => $table, 'colunas' => array_keys($firstRow), 'chave_primaria' => $primaryKey ?: 'id']);
+        Log::info('Nova tabela criada', ['tabela' => $table]);
     }
 
     /**
@@ -176,45 +172,36 @@ class ReceiveDataController extends Controller
      */
     protected function updateTableSchema(string $table, array $firstRow)
     {
-        $existingColumns = Schema::connection('tenant')->getColumnListing($table);
-        $primaryKey = $this->guessPrimaryKey(array_keys($firstRow), $table);
-        $newColumns = array_diff(array_keys($firstRow), $existingColumns);
-
-        // Ignorar 'ID' se 'id' já existe como chave primária
-        if ($primaryKey && in_array($primaryKey, $newColumns) && in_array('id', $existingColumns)) {
-            $newColumns = array_diff($newColumns, [$primaryKey]);
-        }
-
-        if (empty($newColumns)) {
+        $existing = Schema::connection('tenant')->getColumnListing($table);
+        $newCols = array_diff(array_keys($firstRow), $existing);
+        if (empty($newCols)) {
             Log::info('Nenhuma nova coluna detectada para a tabela', ['tabela' => $table]);
             return;
         }
+        Log::info('Novas colunas detectadas, atualizando esquema', ['tabela' => $table, 'novas_colunas' => $newCols]);
 
-        Log::info('Novas colunas detectadas, atualizando esquema', [
-            'tabela' => $table,
-            'novas_colunas' => $newColumns
-        ]);
-
-        Schema::connection('tenant')->table($table, function (Blueprint $t) use ($firstRow, $newColumns) {
-            foreach ($newColumns as $column) {
-                if (strtolower($column) === 'id') {
-                    continue;
-                }
+        Schema::connection('tenant')->table($table, function (Blueprint $t) use ($firstRow, $newCols) {
+            foreach ($newCols as $column) {
+                if (Str::lower($column) === 'id') continue;
 
                 $value = $firstRow[$column];
-                if (is_int($value)) {
+                if ($this->isBoolean($value)) {
+                    $t->boolean($column)->nullable()->after('id');
+                } elseif ($this->isDate($value)) {
+                    $t->date($column)->nullable()->after('id');
+                } elseif ($this->isDateTime($value)) {
+                    $t->dateTime($column)->nullable()->after('id');
+                } elseif (is_int($value)) {
                     $t->integer($column)->nullable()->after('id');
                 } elseif (is_float($value)) {
                     $t->float($column)->nullable()->after('id');
-                } elseif ($this->isDateTime($value)) {
-                    $t->dateTime($column)->nullable()->after('id');
                 } else {
-                    $t->text($column)->nullable()->after('id');
+                    $t->string($column, 255)->nullable()->after('id');
                 }
             }
         });
 
-        Log::info('Esquema da tabela atualizado', ['tabela' => $table, 'colunas_adicionadas' => $newColumns]);
+        Log::info('Esquema da tabela atualizado', ['tabela' => $table]);
     }
 
     /**
@@ -222,34 +209,27 @@ class ReceiveDataController extends Controller
      */
     protected function filterRows(array $rows, array $columns, string $table, ?string $primaryKey): array
     {
-        $mappedRows = array_map(function ($row) use ($columns, $primaryKey, $table) {
-            $mappedRow = [];
-            foreach ($row as $key => $value) {
-                // Mapear a chave primária do payload para 'id' se a coluna 'id' existe na tabela
-                $mappedKey = ($primaryKey && $key === $primaryKey && in_array('id', $columns)) ? 'id' : $key;
-                if (in_array($mappedKey, $columns)) {
-                    $mappedRow[$mappedKey] = $value;
+        $mapped = array_map(function ($row) use ($columns, $primaryKey) {
+            $out = [];
+            foreach ($row as $k => $v) {
+                $key = ($primaryKey && $k === $primaryKey && in_array('id', $columns)) ? 'id' : $k;
+                if (in_array($key, $columns)) {
+                    $out[$key] = $v;
                 }
             }
-            return $mappedRow;
+            return $out;
         }, $rows);
 
-        // Verificar colunas extras após o mapeamento
-        $payloadColumns = array_keys($rows[0]);
-        // Se a chave primária existe e está mapeada para 'id', removê-la das colunas do payload
-        if ($primaryKey && in_array('id', $columns) && in_array($primaryKey, $payloadColumns)) {
-            $payloadColumns = array_diff($payloadColumns, [$primaryKey]);
+        $payloadCols = array_keys($rows[0]);
+        if ($primaryKey && in_array('id', $columns) && in_array($primaryKey, $payloadCols)) {
+            $payloadCols = array_diff($payloadCols, [$primaryKey]);
         }
-        $extraColumns = array_diff($payloadColumns, $columns);
-
-        if (!empty($extraColumns)) {
-            Log::warning('Colunas no payload não presentes na tabela', [
-                'tabela' => $table,
-                'colunas_extras' => $extraColumns
-            ]);
+        $extra = array_diff($payloadCols, $columns);
+        if (!empty($extra)) {
+            Log::warning('Colunas no payload não presentes na tabela', ['tabela' => $table, 'colunas_extras' => $extra]);
         }
 
-        return $mappedRows;
+        return $mapped;
     }
 
     /**
@@ -257,69 +237,49 @@ class ReceiveDataController extends Controller
      */
     protected function detectPrimaryKey(string $table, array $columns, array $firstRow): array
     {
-        $primaryKey = $this->guessPrimaryKey(array_keys($firstRow), $table);
-        if ($primaryKey && in_array('id', $columns)) {
-            Log::info('Chave primária mapeada', ['tabela' => $table, 'chave' => $primaryKey, 'mapeada_para' => 'id']);
+        // heurística inicial
+        $pk = $this->guessPrimaryKey($columns, $table);
+        if ($pk && in_array('id', $columns)) {
             return ['id'];
         }
 
         try {
-            $schemaManager = Schema::connection('tenant')->getConnection()->getDoctrineConnection()->getSchemaManager();
-            $tableDetails = $schemaManager->listTableDetails($table);
-
-            $primaryKeySchema = $tableDetails->getPrimaryKey();
-            if ($primaryKeySchema) {
-                $pkColumns = $primaryKeySchema->getColumns();
-                Log::info('Chave primária detectada via schema', ['tabela' => $table, 'chave' => $pkColumns]);
-                return $pkColumns;
+            $manager = Schema::connection('tenant')->getConnection()->getDoctrineConnection()->getSchemaManager();
+            $details = $manager->listTableDetails($table);
+            $schemaPk = $details->getPrimaryKey();
+            if ($schemaPk) {
+                return $schemaPk->getColumns();
             }
         } catch (\Throwable $e) {
-            Log::warning('Falha ao detectar chave primária via schema', [
-                'tabela' => $table,
-                'erro' => $e->getMessage()
-            ]);
+            Log::warning('Falha ao detectar chave primária via schema', ['tabela' => $table, 'erro' => $e->getMessage()]);
         }
 
-        $fallbackKey = $columns[0] ?? null;
-        if ($fallbackKey) {
-            Log::warning('Usando fallback para chave primária', ['tabela' => $table, 'chave' => $fallbackKey]);
-            return [$fallbackKey];
-        } else {
-            Log::error('Não foi possível determinar uma chave única para a tabela', ['tabela' => $table]);
-            throw new \Exception('Não foi possível determinar uma chave única para a tabela ' . $table);
+        $fallback = $columns[0] ?? null;
+        if ($fallback) {
+            Log::warning('Usando fallback para chave primária', ['tabela' => $table, 'chave' => $fallback]);
+            return [$fallback];
         }
+
+        throw new \Exception("Não foi possível determinar chave única para tabela $table");
     }
 
     /**
-     * Guess the primary key based on table name and column names
+     * Guess the primary key based on heuristics
      */
     protected function guessPrimaryKey(array $columns, string $table): ?string
     {
-        $tablePrimaryKeyMap = [
-            'wp_users' => 'ID',
-            'wp_comments' => 'comment_ID',
-            'wp_postmeta' => 'meta_id',
-            'wp_usermeta' => 'umeta_id',
-            'wp_terms' => 'term_id',
-            'wp_term_taxonomy' => 'term_taxonomy_id',
-            'wp_term_relationships' => ['object_id', 'term_taxonomy_id'],
-            'wp_posts' => 'ID',
+        $map = [
+            'wp_users' => 'ID', 'wp_comments' => 'comment_ID', 'wp_postmeta' => 'meta_id',
+            'wp_usermeta' => 'umeta_id', 'wp_terms' => 'term_id',
+            'wp_term_taxonomy' => 'term_taxonomy_id', 'wp_posts' => 'ID',
         ];
-
-        if (isset($tablePrimaryKeyMap[$table])) {
-            $primaryKey = $tablePrimaryKeyMap[$table];
-            if (is_array($primaryKey)) {
-                if (count(array_intersect($primaryKey, $columns)) === count($primaryKey)) {
-                    return $primaryKey[0];
-                }
-            } elseif (in_array($primaryKey, $columns)) {
-                return $primaryKey;
-            }
+        if (isset($map[$table])) {
+            return is_array($map[$table]) ? $map[$table][0] : $map[$table];
         }
 
-        foreach ($columns as $column) {
-            if (in_array(strtolower($column), ['id', $table . '_id'])) {
-                return $column;
+        foreach ($columns as $col) {
+            if (in_array(Str::lower($col), ['id', $table . '_id'])) {
+                return $col;
             }
         }
 
@@ -331,14 +291,31 @@ class ReceiveDataController extends Controller
      */
     protected function isDateTime($value): bool
     {
-        if (!$value || !is_string($value)) return false;
+        return is_string($value) && strtotime($value) !== false && preg_match('/\d{2}:\d{2}:\d{2}/', $value);
+    }
 
-        try {
-            new \DateTime($value);
-            return true;
-        } catch (\Exception $e) {
-            return false;
-        }
+    /**
+     * Check if value is date only
+     */
+    protected function isDate($value): bool
+    {
+        return is_string($value) && strtotime($value) !== false && !preg_match('/\d{2}:\d{2}:\d{2}/', $value);
+    }
+
+    /**
+     * Check if value is boolean
+     */
+    protected function isBoolean($value): bool
+    {
+        return in_array($value, [0, 1, '0', '1', true, false], true);
+    }
+
+    /**
+     * Sanitize table name to prevent SQL injection or invalid names
+     */
+    protected function sanitizeTableName(string $name): string
+    {
+        return preg_replace('/[^a-zA-Z0-9_]/', '', $name);
     }
 
     /**
@@ -355,16 +332,13 @@ class ReceiveDataController extends Controller
                     'host' => env('DB_HOST', '127.0.0.1'),
                     'port' => env('DB_PORT', '3306'),
                     'database' => $dbName,
-                    'username' => env('DB_USERNAME', 'your_username'),
-                    'password' => env('DB_PASSWORD', 'your_password'),
+                    'username' => env('DB_USERNAME'),
+                    'password' => env('DB_PASSWORD'),
                     'charset' => 'utf8mb4',
                     'collation' => 'utf8mb4_unicode_ci',
                     'prefix' => '',
                     'strict' => true,
                     'engine' => null,
-                    'options' => [
-                        \PDO::ATTR_AUTOCOMMIT => false,
-                    ],
                 ]
             ]);
 
@@ -374,39 +348,27 @@ class ReceiveDataController extends Controller
             Log::info('Conexão bem-sucedida com MySQL', ['database' => $dbName]);
             return;
         } catch (\Exception $e) {
-            Log::warning('Falha ao conectar com MySQL, tentando SQLite', [
-                'database' => $dbName,
-                'erro' => $e->getMessage()
-            ]);
+            Log::warning('Falha ao conectar com MySQL, tentando SQLite', ['database' => $dbName, 'erro' => $e->getMessage()]);
         }
 
         $sqlitePath = database_path("tenants/{$dbName}.sqlite");
         if (!file_exists($sqlitePath)) {
-            Log::warning('Arquivo SQLite não encontrado, pulando tentativa de conexão', ['path' => $sqlitePath]);
+            Log::warning('Arquivo SQLite não encontrado, pulando tentativa', ['path' => $sqlitePath]);
             throw new \Exception('Não foi possível conectar ao banco de dados do tenant: ' . $dbName);
         }
 
-        try {
-            config([
-                'database.connections.tenant' => [
-                    'driver' => 'sqlite',
-                    'database' => $sqlitePath,
-                    'prefix' => '',
-                    'foreign_key_constraints' => true,
-                ]
-            ]);
-
-            DB::purge('tenant');
-            DB::reconnect('tenant');
-            DB::connection('tenant')->getPdo();
-            Log::info('Conexão bem-sucedida com SQLite', ['database' => $sqlitePath]);
-            return;
-        } catch (\Exception $e) {
-            Log::error('Falha ao conectar com SQLite', [
+        config([
+            'database.connections.tenant' => [
+                'driver' => 'sqlite',
                 'database' => $sqlitePath,
-                'erro' => $e->getMessage()
-            ]);
-            throw new \Exception('Não foi possível conectar ao banco de dados do tenant: ' . $dbName);
-        }
+                'prefix' => '',
+                'foreign_key_constraints' => true,
+            ]
+        ]);
+
+        DB::purge('tenant');
+        DB::reconnect('tenant');
+        DB::connection('tenant')->getPdo();
+        Log::info('Conexão bem-sucedida com SQLite', ['database' => $sqlitePath]);
     }
 }

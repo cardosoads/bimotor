@@ -83,11 +83,6 @@ const submit = () => {
                     Entrar
                 </Button>
             </div>
-
-            <div class="text-center text-sm text-muted-foreground">
-                Não tem conta?
-                <TextLink :href="route('register')" :tabindex="5">Cadastre-se</TextLink>
-            </div>
         </form>
     </AuthBase>
 </template>
