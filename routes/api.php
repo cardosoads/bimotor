@@ -22,3 +22,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/receive', [ReceiveDataController::class, 'store']);
     Route::get('/received-data', [ReceiveDataController::class, 'index']);
 });
+
+Route::middleware('auth:sanctum')->group(function () {
+    // Endpoint para integração com BI
+    Route::post('/connectbi', [ReceiveDataController::class, 'connectBI']);
+});

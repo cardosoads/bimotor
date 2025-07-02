@@ -371,4 +371,92 @@ class ReceiveDataController extends Controller
         DB::connection('tenant')->getPdo();
         Log::info('Conexão bem-sucedida com SQLite', ['database' => $sqlitePath]);
     }
+
+    /**
+     * Provide connection details and metadata for BI tools.
+     */
+    public function connectBI(Request $request)
+    {
+        Log::info('Requisição recebida no endpoint /connectbi', [
+            'payload' => $request->all(),
+            'headers' => $request->headers->all()
+        ]);
+
+        // Validação dos dados de entrada
+        $data = $request->validate([
+            'user_identifier' => 'required|string',
+            'database_name' => 'nullable|string', // Opcional, caso queira especificar o banco diretamente
+        ]);
+
+        try {
+            // Buscar o cliente pelo identificador
+            $client = Client::where('id', $data['user_identifier'])
+                ->orWhere('database_name', $data['user_identifier'])
+                ->firstOrFail();
+            Log::info('Cliente encontrado', ['client_id' => $client->id, 'database_name' => $client->database_name]);
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            Log::error('Cliente não encontrado para o identificador', ['user_identifier' => $data['user_identifier']]);
+            return response()->json(['error' => 'Cliente não encontrado'], 404);
+        }
+
+        try {
+            // Conectar ao banco do cliente
+            $this->connectToTenant($client);
+            DB::connection('tenant')->getPdo();
+            Log::info('Conectado com sucesso ao banco de dados do tenant', ['database' => $client->database_name]);
+        } catch (\Exception $e) {
+            Log::error('Falha ao conectar ao banco de dados do tenant', [
+                'database' => $client->database_name,
+                'erro' => $e->getMessage()
+            ]);
+            return response()->json(['error' => 'Falha na conexão com o banco de dados do tenant'], 500);
+        }
+
+        try {
+            // Obter informações do banco
+            $connectionDetails = [
+                'driver' => config('database.connections.tenant.driver'),
+                'host' => config('database.connections.tenant.host', '127.0.0.1'),
+                'port' => config('database.connections.tenant.port', '3306'),
+                'database' => $client->database_name,
+                'charset' => config('database.connections.tenant.charset', 'utf8mb4'),
+                'collation' => config('database.connections.tenant.collation', 'utf8mb4_unicode_ci'),
+            ];
+
+            // Opcional: Listar tabelas disponíveis no banco
+            $tables = Schema::connection('tenant')->getAllTables();
+            $tableNames = array_map(function ($table) use ($connectionDetails) {
+                $tableName = is_object($table) ? array_values((array)$table)[0] : $table;
+                return [
+                    'table_name' => $tableName,
+                    // Opcional: Listar colunas da tabela
+                    'columns' => Schema::connection('tenant')->getColumnListing($tableName),
+                ];
+            }, $tables);
+
+            Log::info('Informações do banco preparadas para o BI', [
+                'client_id' => $client->id,
+                'database' => $client->database_name,
+                'tables_count' => count($tableNames)
+            ]);
+
+            // Retornar detalhes de conexão e metadados
+            return response()->json([
+                'message' => 'Informações de conexão para o BI obtidas com sucesso.',
+                'connection' => $connectionDetails,
+                'tables' => $tableNames,
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('Erro ao obter informações do banco para o BI', [
+                'client_id' => $client->id ?? 'desconhecido',
+                'erro' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+
+            return response()->json([
+                'error' => 'Erro ao obter informações do banco',
+                'details' => 'Verifique os logs do servidor para mais informações'
+            ], 500);
+        }
+    }
 }
