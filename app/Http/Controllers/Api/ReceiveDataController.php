@@ -109,6 +109,15 @@ class ReceiveDataController extends Controller
         } else {
             Log::info('Tabela já existe, verificando esquema', ['tabela' => $table]);
             $this->updateTableSchema($table, $rows[0]);
+            // Logar esquema atual da tabela
+            $columns = Schema::connection('tenant')->getColumnListing($table);
+            $columnTypes = array_map(function ($column) use ($table) {
+                return [
+                    'name' => $column,
+                    'type' => Schema::connection('tenant')->getConnection()->getDoctrineColumn($table, $column)->getType()->getName()
+                ];
+            }, $columns);
+            Log::info('Esquema atual da tabela', ['tabela' => $table, 'colunas' => $columnTypes]);
         }
 
         $columns = Schema::connection('tenant')->getColumnListing($table);
@@ -118,16 +127,25 @@ class ReceiveDataController extends Controller
         $uniqueKey = $this->detectPrimaryKey($table, $columns, $rows[0]);
         Log::debug('Dados filtrados para upsert', ['tabela' => $table, 'uniqueKey' => $uniqueKey, 'filteredRows' => $filteredRows]);
 
-        DB::connection('tenant')->table($table)->upsert(
-            $filteredRows,
-            is_array($uniqueKey) ? $uniqueKey : [$uniqueKey],
-            array_diff(
-                $columns,
-                array_merge((array)$uniqueKey, ['created_at', 'updated_at', 'synced_at'])
-            )
-        );
-
-        Log::info('Upsert realizado na tabela', ['tabela' => $table, 'linhas' => count($filteredRows)]);
+        try {
+            DB::connection('tenant')->table($table)->upsert(
+                $filteredRows,
+                is_array($uniqueKey) ? $uniqueKey : [$uniqueKey],
+                array_diff(
+                    $columns,
+                    array_merge((array)$uniqueKey, ['created_at', 'updated_at', 'synced_at'])
+                )
+            );
+            Log::info('Upsert realizado na tabela', ['tabela' => $table, 'linhas' => count($filteredRows)]);
+        } catch (\Exception $e) {
+            // Logar uma amostra dos dados problemáticos
+            Log::error('Erro durante upsert', [
+                'tabela' => $table,
+                'erro' => $e->getMessage(),
+                'amostra_dados' => array_slice($filteredRows, 0, 1) // Logar primeira linha
+            ]);
+            throw $e;
+        }
     }
 
     /**
@@ -146,12 +164,15 @@ class ReceiveDataController extends Controller
                 if ($column === $primaryKey || Str::lower($column) === 'id') continue;
 
                 $value = $firstRow[$column];
-                if ($this->isBoolean($value)) {
+                // Forçar tipo VARCHAR para colunas fiscais conhecidas
+                if (in_array(strtolower($column), ['cfop', 'cst', 'ncm', 'cnpj', 'cpf'])) {
+                    $t->string($column, 255)->nullable();
+                } elseif ($this->isBoolean($value)) {
                     $t->boolean($column)->nullable();
-                } elseif ($this->isDate($value)) {
-                    $t->date($column)->nullable();
                 } elseif ($this->isDateTime($value)) {
                     $t->dateTime($column)->nullable();
+                } elseif ($this->isDate($value)) {
+                    $t->date($column)->nullable();
                 } elseif (is_int($value)) {
                     $t->integer($column)->nullable();
                 } elseif (is_float($value)) {
@@ -185,12 +206,15 @@ class ReceiveDataController extends Controller
                 if (Str::lower($column) === 'id') continue;
 
                 $value = $firstRow[$column];
-                if ($this->isBoolean($value)) {
+                // Forçar tipo VARCHAR para colunas fiscais conhecidas
+                if (in_array(strtolower($column), ['cfop', 'cst', 'ncm', 'cnpj', 'cpf'])) {
+                    $t->string($column, 255)->nullable()->after('id');
+                } elseif ($this->isBoolean($value)) {
                     $t->boolean($column)->nullable()->after('id');
-                } elseif ($this->isDate($value)) {
-                    $t->date($column)->nullable()->after('id');
                 } elseif ($this->isDateTime($value)) {
                     $t->dateTime($column)->nullable()->after('id');
+                } elseif ($this->isDate($value)) {
+                    $t->date($column)->nullable()->after('id');
                 } elseif (is_int($value)) {
                     $t->integer($column)->nullable()->after('id');
                 } elseif (is_float($value)) {
@@ -209,12 +233,17 @@ class ReceiveDataController extends Controller
      */
     protected function filterRows(array $rows, array $columns, string $table, ?string $primaryKey): array
     {
-        $mapped = array_map(function ($row) use ($columns, $primaryKey) {
+        $mapped = array_map(function ($row) use ($columns, $primaryKey, $table) {
             $out = [];
             foreach ($row as $k => $v) {
                 $key = ($primaryKey && $k === $primaryKey && in_array('id', $columns)) ? 'id' : $k;
                 if (in_array($key, $columns)) {
-                    $out[$key] = $v;
+                    // Forçar conversão para string para colunas fiscais
+                    if ($table === 'gw_vendas' && $key === 'cfop') {
+                        $out[$key] = is_null($v) ? null : (string)$v;
+                    } else {
+                        $out[$key] = $v;
+                    }
                 }
             }
             return $out;
@@ -291,7 +320,11 @@ class ReceiveDataController extends Controller
      */
     protected function isDateTime($value): bool
     {
-        return is_string($value) && strtotime($value) !== false && preg_match('/\d{2}:\d{2}:\d{2}/', $value);
+        if (!is_string($value) || empty($value)) {
+            return false;
+        }
+        // Verificar se o valor corresponde a um formato de data e hora (ex.: YYYY-MM-DD HH:MM:SS)
+        return preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', $value) && strtotime($value) !== false;
     }
 
     /**
@@ -299,7 +332,11 @@ class ReceiveDataController extends Controller
      */
     protected function isDate($value): bool
     {
-        return is_string($value) && strtotime($value) !== false && !preg_match('/\d{2}:\d{2}:\d{2}/', $value);
+        if (!is_string($value) || empty($value)) {
+            return false;
+        }
+        // Verificar se o valor corresponde a um formato de data (ex.: YYYY-MM-DD)
+        return preg_match('/^\d{4}-\d{2}-\d{2}$/', $value) && strtotime($value) !== false;
     }
 
     /**
