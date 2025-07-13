@@ -114,7 +114,7 @@ class ReceiveDataController extends Controller
             $columnTypes = array_map(function ($column) use ($table) {
                 return [
                     'name' => $column,
-                    'type' => Schema::connection('tenant')->getConnection()->getDoctrineColumn($table, $column)->getType()->getName()
+                    'type' => Schema::connection('tenant')->getColumnType($table, $column)
                 ];
             }, $columns);
             Log::info('Esquema atual da tabela', ['tabela' => $table, 'colunas' => $columnTypes]);
