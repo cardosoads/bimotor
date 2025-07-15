@@ -20,7 +20,7 @@ class ReceiveDataController extends Controller
     {
         Log::info('Requisição recebida no endpoint /receive', [
             'payload' => $request->all(),
-            'headers' => $request->headers->all()
+            'headers' => $request->headers->all(),
         ]);
 
         $data = $request->validate([
@@ -29,471 +29,302 @@ class ReceiveDataController extends Controller
             'payload.*' => 'array',
         ]);
 
-        Log::info('Requisição ReceiveData recebida', [
+        Log::info('ReceiveData payload', [
             'user_identifier' => $data['user_identifier'],
-            'tabelas' => array_keys($data['payload']),
-            'total_tabelas' => count($data['payload']),
-            'total_linhas' => array_sum(array_map('count', $data['payload']))
+            'tables' => array_keys($data['payload']),
+            'total_tables' => count($data['payload']),
+            'total_rows' => array_sum(array_map('count', $data['payload'])),
         ]);
 
+        // Find client
         try {
             $client = Client::where('id', $data['user_identifier'])
                 ->orWhere('database_name', $data['user_identifier'])
                 ->firstOrFail();
-            Log::info('Cliente encontrado', ['client_id' => $client->id, 'database_name' => $client->database_name]);
-        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
-            Log::error('Cliente não encontrado para o identificador', ['user_identifier' => $data['user_identifier']]);
+            Log::info('Cliente encontrado', ['id' => $client->id, 'db' => $client->database_name]);
+        } catch (\Exception $e) {
+            Log::error('Cliente não encontrado', ['identifier' => $data['user_identifier']]);
             return response()->json(['error' => 'Cliente não encontrado'], 404);
         }
 
+        // Connect tenant
         try {
             $this->connectToTenant($client);
             DB::connection('tenant')->getPdo();
-            Log::info('Conectado com sucesso ao banco de dados do tenant', ['database' => $client->database_name]);
+            Log::info('Conectado ao tenant', ['database' => $client->database_name]);
         } catch (\Exception $e) {
-            Log::error('Falha ao conectar ao banco de dados do tenant', [
-                'database' => $client->database_name,
-                'erro' => $e->getMessage()
-            ]);
-            return response()->json(['error' => 'Falha na conexão com o banco de dados do tenant'], 500);
+            Log::error('Erro conexão tenant', ['error' => $e->getMessage()]);
+            return response()->json(['error' => 'Falha na conexão com o tenant'], 500);
         }
 
-        try {
-            $conn = DB::connection('tenant');
-            $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, false);
-            $conn->beginTransaction();
-            Log::info('Transação iniciada para o tenant', ['database' => $client->database_name]);
+        $conn = DB::connection('tenant');
+        $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, false);
+        $conn->beginTransaction();
 
+        try {
             foreach ($data['payload'] as $rawTable => $rows) {
-                // Sanitizar nome de tabela
                 $table = $this->sanitizeTableName($rawTable);
-                if (!is_array($rows) || empty($rows)) {
+                if (empty($rows)) {
                     Log::info("Ignorando tabela vazia: $table");
                     continue;
                 }
+                Log::info('Processando tabela', ['table' => $table, 'rows' => count($rows)]);
 
-                Log::info('Iniciando processamento da tabela', ['tabela' => $table, 'linhas' => count($rows)]);
-                $this->processTable($table, $rows);
-                Log::info('Processamento da tabela concluído', ['tabela' => $table]);
+                if (!Schema::connection('tenant')->hasTable($table)) {
+                    $this->createTable($table, $rows[0]);
+                } else {
+                    $this->updateTableSchema($table, $rows[0]);
+                }
+
+                // Prevent row-size errors
+                DB::connection('tenant')->statement("ALTER TABLE `$table` ROW_FORMAT=DYNAMIC");
+
+                $cols = Schema::connection('tenant')->getColumnListing($table);
+                $pk = $this->guessPrimaryKey($cols, $table);
+                $filtered = $this->filterRows($rows, $cols, $table, $pk);
+                $unique = $this->detectPrimaryKey($table, $cols, $rows[0]);
+
+                DB::connection('tenant')->table($table)->upsert(
+                    $filtered,
+                    (array) $unique,
+                    array_diff($cols, array_merge((array) $unique, ['created_at','updated_at','synced_at']))
+                );
+                Log::info('Upsert concluído', ['table' => $table, 'count' => count($filtered)]);
             }
 
             $conn->commit();
             $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
-            Log::info('Todos os dados foram sincronizados com sucesso para o cliente', ['client_id' => $client->id]);
+            Log::info('Sincronização finalizada', ['client_id' => $client->id]);
 
-            return response()->json(['message' => 'Dados sincronizados com sucesso.']);
+            return response()->json(['message' => 'Dados sincronizados com sucesso']);
         } catch (\Throwable $e) {
-            DB::connection('tenant')->rollBack();
-            DB::connection('tenant')->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
-            Log::error('Erro ao sincronizar dados', [
-                'client_id' => $client->id ?? 'desconhecido',
-                'erro' => $e->getMessage(),
-                'trace' => $e->getTraceAsString()
-            ]);
-
-            return response()->json([
-                'error' => $e->getMessage(),
-                'details' => 'Verifique os logs do servidor para mais informações'
-            ], 500);
+            $conn->rollBack();
+            $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
+            Log::error('Erro na transação', ['error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
+            return response()->json(['error' => $e->getMessage()], 500);
         }
     }
 
     /**
-     * Process individual table
-     */
-    protected function processTable(string $table, array $rows)
-    {
-        if (!Schema::connection('tenant')->hasTable($table)) {
-            Log::info('Tabela não existe, criando nova tabela', ['tabela' => $table]);
-            $this->createTable($table, $rows[0]);
-        } else {
-            Log::info('Tabela já existe, verificando esquema', ['tabela' => $table]);
-            $this->updateTableSchema($table, $rows[0]);
-            // Logar esquema atual da tabela
-            $columns = Schema::connection('tenant')->getColumnListing($table);
-            $columnTypes = array_map(function ($column) use ($table) {
-                return [
-                    'name' => $column,
-                    'type' => Schema::connection('tenant')->getColumnType($table, $column)
-                ];
-            }, $columns);
-            Log::info('Esquema atual da tabela', ['tabela' => $table, 'colunas' => $columnTypes]);
-        }
-
-        $columns = Schema::connection('tenant')->getColumnListing($table);
-        $primaryKey = $this->guessPrimaryKey($columns, $table);
-        $filteredRows = $this->filterRows($rows, $columns, $table, $primaryKey);
-
-        $uniqueKey = $this->detectPrimaryKey($table, $columns, $rows[0]);
-        Log::debug('Dados filtrados para upsert', ['tabela' => $table, 'uniqueKey' => $uniqueKey, 'filteredRows' => $filteredRows]);
-
-        try {
-            DB::connection('tenant')->table($table)->upsert(
-                $filteredRows,
-                is_array($uniqueKey) ? $uniqueKey : [$uniqueKey],
-                array_diff(
-                    $columns,
-                    array_merge((array)$uniqueKey, ['created_at', 'updated_at', 'synced_at'])
-                )
-            );
-            Log::info('Upsert realizado na tabela', ['tabela' => $table, 'linhas' => count($filteredRows)]);
-        } catch (\Exception $e) {
-            // Logar uma amostra dos dados problemáticos
-            Log::error('Erro durante upsert', [
-                'tabela' => $table,
-                'erro' => $e->getMessage(),
-                'amostra_dados' => array_slice($filteredRows, 0, 1) // Logar primeira linha
-            ]);
-            throw $e;
-        }
-    }
-
-    /**
-     * Create new table with dynamic schema
+     * Create table dynamically.
      */
     protected function createTable(string $table, array $firstRow)
     {
-        Log::info('Criando nova tabela', ['tabela' => $table]);
-
-        $primaryKey = $this->guessPrimaryKey(array_keys($firstRow), $table);
-        $columns = array_keys($firstRow);
-
-        Schema::connection('tenant')->create($table, function (Blueprint $t) use ($firstRow, $primaryKey, $columns) {
+        $cols = array_keys($firstRow);
+        Schema::connection('tenant')->create($table, function (Blueprint $t) use ($firstRow, $cols) {
             $t->id();
-            foreach ($columns as $column) {
-                if ($column === $primaryKey || Str::lower($column) === 'id') continue;
+            foreach ($cols as $col) {
+                if (Str::lower($col) === 'id') continue;
+                $val = $firstRow[$col];
 
-                $value = $firstRow[$column];
-                // Forçar tipo VARCHAR para colunas fiscais conhecidas
-                if (in_array(strtolower($column), ['cfop', 'cst', 'ncm', 'cnpj', 'cpf'])) {
-                    $t->string($column, 255)->nullable();
-                } elseif ($this->isBoolean($value)) {
-                    $t->boolean($column)->nullable();
-                } elseif ($this->isDateTime($value)) {
-                    $t->dateTime($column)->nullable();
-                } elseif ($this->isDate($value)) {
-                    $t->date($column)->nullable();
-                } elseif (is_int($value)) {
-                    $t->integer($column)->nullable();
-                } elseif (is_float($value)) {
-                    $t->float($column)->nullable();
+                if (count($cols) > 50 || in_array(Str::lower($col), ['cfop','cst','ncm','cnpj','cpf'])) {
+                    $t->text($col)->nullable();
+                } elseif ($this->isBoolean($val)) {
+                    $t->boolean($col)->nullable();
+                } elseif ($this->isDateTime($val)) {
+                    $t->dateTime($col)->nullable();
+                } elseif ($this->isDate($val)) {
+                    $t->date($col)->nullable();
+                } elseif (is_numeric($val) && (int)$val > 2147483647) {
+                    $t->bigInteger($col)->nullable();
+                } elseif (is_int($val)) {
+                    $t->integer($col)->nullable();
+                } elseif (is_float($val)) {
+                    $t->float($col)->nullable();
                 } else {
-                    $t->string($column, 255)->nullable();
+                    $t->string($col, 191)->nullable();
                 }
             }
             $t->timestamps();
             $t->timestamp('synced_at')->nullable();
         });
-
-        Log::info('Nova tabela criada', ['tabela' => $table]);
     }
 
     /**
-     * Update existing table schema to add new columns
+     * Update table schema if new columns appear.
      */
     protected function updateTableSchema(string $table, array $firstRow)
     {
         $existing = Schema::connection('tenant')->getColumnListing($table);
-        $newCols = array_diff(array_keys($firstRow), $existing);
-        if (empty($newCols)) {
-            Log::info('Nenhuma nova coluna detectada para a tabela', ['tabela' => $table]);
-            return;
-        }
-        Log::info('Novas colunas detectadas, atualizando esquema', ['tabela' => $table, 'novas_colunas' => $newCols]);
+        $new = array_diff(array_keys($firstRow), $existing);
+        if (empty($new)) return;
 
-        Schema::connection('tenant')->table($table, function (Blueprint $t) use ($firstRow, $newCols) {
-            foreach ($newCols as $column) {
-                if (Str::lower($column) === 'id') continue;
+        Schema::connection('tenant')->table($table, function (Blueprint $t) use ($new, $firstRow) {
+            foreach ($new as $col) {
+                if (Str::lower($col) === 'id') continue;
+                $val = $firstRow[$col];
 
-                $value = $firstRow[$column];
-                // Forçar tipo VARCHAR para colunas fiscais conhecidas
-                if (in_array(strtolower($column), ['cfop', 'cst', 'ncm', 'cnpj', 'cpf'])) {
-                    $t->string($column, 255)->nullable()->after('id');
-                } elseif ($this->isBoolean($value)) {
-                    $t->boolean($column)->nullable()->after('id');
-                } elseif ($this->isDateTime($value)) {
-                    $t->dateTime($column)->nullable()->after('id');
-                } elseif ($this->isDate($value)) {
-                    $t->date($column)->nullable()->after('id');
-                } elseif (is_int($value)) {
-                    $t->integer($column)->nullable()->after('id');
-                } elseif (is_float($value)) {
-                    $t->float($column)->nullable()->after('id');
+                if (is_numeric($val) && (int)$val > 2147483647) {
+                    $t->bigInteger($col)->nullable()->after('id');
+                } elseif (in_array(Str::lower($col), ['cfop','cst','ncm','cnpj','cpf'])) {
+                    $t->text($col)->nullable()->after('id');
+                } elseif ($this->isBoolean($val)) {
+                    $t->boolean($col)->nullable()->after('id');
+                } elseif ($this->isDateTime($val)) {
+                    $t->dateTime($col)->nullable()->after('id');
+                } elseif ($this->isDate($val)) {
+                    $t->date($col)->nullable()->after('id');
+                } elseif (is_int($val)) {
+                    $t->integer($col)->nullable()->after('id');
+                } elseif (is_float($val)) {
+                    $t->float($col)->nullable()->after('id');
                 } else {
-                    $t->string($column, 255)->nullable()->after('id');
+                    $t->string($col, 191)->nullable()->after('id');
                 }
             }
         });
-
-        Log::info('Esquema da tabela atualizado', ['tabela' => $table]);
     }
 
     /**
-     * Filter rows to match table columns
+     * Filter rows to existing columns.
      */
-    protected function filterRows(array $rows, array $columns, string $table, ?string $primaryKey): array
+    protected function filterRows(array $rows, array $cols, string $table, ?string $pk): array
     {
-        $mapped = array_map(function ($row) use ($columns, $primaryKey, $table) {
+        return array_map(function ($row) use ($cols, $pk) {
             $out = [];
             foreach ($row as $k => $v) {
-                $key = ($primaryKey && $k === $primaryKey && in_array('id', $columns)) ? 'id' : $k;
-                if (in_array($key, $columns)) {
-                    // Forçar conversão para string para colunas fiscais
-                    if ($table === 'gw_vendas' && $key === 'cfop') {
-                        $out[$key] = is_null($v) ? null : (string)$v;
-                    } else {
-                        $out[$key] = $v;
-                    }
+                $key = ($pk && $k === $pk && in_array('id', $cols)) ? 'id' : $k;
+                if (in_array($key, $cols)) {
+                    $out[$key] = $v;
                 }
             }
             return $out;
         }, $rows);
-
-        $payloadCols = array_keys($rows[0]);
-        if ($primaryKey && in_array('id', $columns) && in_array($primaryKey, $payloadCols)) {
-            $payloadCols = array_diff($payloadCols, [$primaryKey]);
-        }
-        $extra = array_diff($payloadCols, $columns);
-        if (!empty($extra)) {
-            Log::warning('Colunas no payload não presentes na tabela', ['tabela' => $table, 'colunas_extras' => $extra]);
-        }
-
-        return $mapped;
     }
 
     /**
-     * Detect primary key with schema inspection or heuristic
+     * Detect primary key via schema or heuristics.
      */
-    protected function detectPrimaryKey(string $table, array $columns, array $firstRow): array
+    protected function detectPrimaryKey(string $table, array $cols, array $row): array
     {
-        // heurística inicial
-        $pk = $this->guessPrimaryKey($columns, $table);
-        if ($pk && in_array('id', $columns)) {
-            return ['id'];
-        }
-
+        if (in_array('id', $cols)) return ['id'];
         try {
-            $manager = Schema::connection('tenant')->getConnection()->getDoctrineConnection()->getSchemaManager();
-            $details = $manager->listTableDetails($table);
-            $schemaPk = $details->getPrimaryKey();
-            if ($schemaPk) {
-                return $schemaPk->getColumns();
-            }
+            $sm = Schema::connection('tenant')->getConnection()->getDoctrineConnection()->getSchemaManager();
+            $pk = $sm->listTableDetails($table)->getPrimaryKey();
+            if ($pk) return $pk->getColumns();
         } catch (\Throwable $e) {
-            Log::warning('Falha ao detectar chave primária via schema', ['tabela' => $table, 'erro' => $e->getMessage()]);
         }
-
-        $fallback = $columns[0] ?? null;
-        if ($fallback) {
-            Log::warning('Usando fallback para chave primária', ['tabela' => $table, 'chave' => $fallback]);
-            return [$fallback];
-        }
-
-        throw new \Exception("Não foi possível determinar chave única para tabela $table");
+        return [array_key_first($row)];
     }
 
     /**
-     * Guess the primary key based on heuristics
+     * Guess PK by name.
      */
-    protected function guessPrimaryKey(array $columns, string $table): ?string
+    protected function guessPrimaryKey(array $cols, string $table): ?string
     {
-        $map = [
-            'wp_users' => 'ID', 'wp_comments' => 'comment_ID', 'wp_postmeta' => 'meta_id',
-            'wp_usermeta' => 'umeta_id', 'wp_terms' => 'term_id',
-            'wp_term_taxonomy' => 'term_taxonomy_id', 'wp_posts' => 'ID',
-        ];
-        if (isset($map[$table])) {
-            return is_array($map[$table]) ? $map[$table][0] : $map[$table];
-        }
-
-        foreach ($columns as $col) {
-            if (in_array(Str::lower($col), ['id', $table . '_id'])) {
+        foreach ($cols as $col) {
+            if (Str::lower($col) === 'id' || Str::lower($col) === $table . '_id') {
                 return $col;
             }
         }
-
         return null;
     }
 
-    /**
-     * Check if value is datetime
-     */
-    protected function isDateTime($value): bool
+    protected function isDateTime($v): bool
     {
-        if (!is_string($value) || empty($value)) {
-            return false;
-        }
-        // Verificar se o valor corresponde a um formato de data e hora (ex.: YYYY-MM-DD HH:MM:SS)
-        return preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', $value) && strtotime($value) !== false;
+        return is_string($v) && preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', $v);
     }
 
-    /**
-     * Check if value is date only
-     */
-    protected function isDate($value): bool
+    protected function isDate($v): bool
     {
-        if (!is_string($value) || empty($value)) {
-            return false;
-        }
-        // Verificar se o valor corresponde a um formato de data (ex.: YYYY-MM-DD)
-        return preg_match('/^\d{4}-\d{2}-\d{2}$/', $value) && strtotime($value) !== false;
+        return is_string($v) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $v);
     }
 
-    /**
-     * Check if value is boolean
-     */
-    protected function isBoolean($value): bool
+    protected function isBoolean($v): bool
     {
-        return in_array($value, [0, 1, '0', '1', true, false], true);
+        return in_array($v, [0,1,'0','1',true,false], true);
     }
 
-    /**
-     * Sanitize table name to prevent SQL injection or invalid names
-     */
     protected function sanitizeTableName(string $name): string
     {
         return preg_replace('/[^a-zA-Z0-9_]/', '', $name);
     }
 
     /**
-     * Configure tenant database connection
+     * Configure tenant connection with MySQL fallback to SQLite.
      */
     protected function connectToTenant(Client $client)
     {
-        $dbName = $client->database_name;
+        $db = $client->database_name;
 
-        try {
-            config([
-                'database.connections.tenant' => [
-                    'driver' => 'mysql',
-                    'host' => env('DB_HOST', '127.0.0.1'),
-                    'port' => env('DB_PORT', '3306'),
-                    'database' => $dbName,
-                    'username' => env('DB_USERNAME'),
-                    'password' => env('DB_PASSWORD'),
-                    'charset' => 'utf8mb4',
-                    'collation' => 'utf8mb4_unicode_ci',
-                    'prefix' => '',
-                    'strict' => true,
-                    'engine' => null,
-                ]
-            ]);
-
-            DB::purge('tenant');
-            DB::reconnect('tenant');
-            DB::connection('tenant')->getPdo();
-            Log::info('Conexão bem-sucedida com MySQL', ['database' => $dbName]);
-            return;
-        } catch (\Exception $e) {
-            Log::warning('Falha ao conectar com MySQL, tentando SQLite', ['database' => $dbName, 'erro' => $e->getMessage()]);
-        }
-
-        $sqlitePath = database_path("tenants/{$dbName}.sqlite");
-        if (!file_exists($sqlitePath)) {
-            Log::warning('Arquivo SQLite não encontrado, pulando tentativa', ['path' => $sqlitePath]);
-            throw new \Exception('Não foi possível conectar ao banco de dados do tenant: ' . $dbName);
-        }
-
-        config([
-            'database.connections.tenant' => [
-                'driver' => 'sqlite',
-                'database' => $sqlitePath,
-                'prefix' => '',
-                'foreign_key_constraints' => true,
-            ]
-        ]);
-
+        // Tenta MySQL
+        config(['database.connections.tenant' => [
+            'driver'    => 'mysql',
+            'host'      => env('DB_HOST', '127.0.0.1'),
+            'port'      => env('DB_PORT', '3306'),
+            'database'  => $db,
+            'username'  => env('DB_USERNAME'),
+            'password'  => env('DB_PASSWORD'),
+            'charset'   => 'utf8mb4',
+            'collation' => 'utf8mb4_unicode_ci',
+            'strict'    => true,
+        ]]);
         DB::purge('tenant');
         DB::reconnect('tenant');
-        DB::connection('tenant')->getPdo();
-        Log::info('Conexão bem-sucedida com SQLite', ['database' => $sqlitePath]);
+
+        try {
+            DB::connection('tenant')->getPdo();
+            return;
+        } catch (\Exception $e) {
+            Log::warning('MySQL falhou, tentando SQLite', ['db' => $db, 'error' => $e->getMessage()]);
+        }
+
+        // Fallback SQLite
+        $path = database_path("tenants/{$db}.sqlite");
+        if (!file_exists($path)) {
+            throw new \Exception("SQLite não encontrado: $path");
+        }
+        config(['database.connections.tenant' => [
+            'driver'                  => 'sqlite',
+            'database'                => $path,
+            'prefix'                  => '',
+            'foreign_key_constraints' => true,
+        ]]);
+        DB::purge('tenant');
+        DB::reconnect('tenant');
     }
 
     /**
-     * Provide connection details and metadata for BI tools.
+     * Provide BI connection details.
      */
     public function connectBI(Request $request)
     {
-        Log::info('Requisição recebida no endpoint /connectbi', [
+        Log::info('ReceiveData /connectbi', [
             'payload' => $request->all(),
-            'headers' => $request->headers->all()
+            'headers' => $request->headers->all(),
         ]);
 
-        // Validação dos dados de entrada
         $data = $request->validate([
             'user_identifier' => 'required|string',
-            'database_name' => 'nullable|string', // Opcional, caso queira especificar o banco diretamente
+            'database_name'   => 'nullable|string',
         ]);
 
         try {
-            // Buscar o cliente pelo identificador
             $client = Client::where('id', $data['user_identifier'])
                 ->orWhere('database_name', $data['user_identifier'])
                 ->firstOrFail();
-            Log::info('Cliente encontrado', ['client_id' => $client->id, 'database_name' => $client->database_name]);
-        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
-            Log::error('Cliente não encontrado para o identificador', ['user_identifier' => $data['user_identifier']]);
+        } catch (\Exception $e) {
             return response()->json(['error' => 'Cliente não encontrado'], 404);
         }
 
         try {
-            // Conectar ao banco do cliente
             $this->connectToTenant($client);
-            DB::connection('tenant')->getPdo();
-            Log::info('Conectado com sucesso ao banco de dados do tenant', ['database' => $client->database_name]);
         } catch (\Exception $e) {
-            Log::error('Falha ao conectar ao banco de dados do tenant', [
-                'database' => $client->database_name,
-                'erro' => $e->getMessage()
-            ]);
-            return response()->json(['error' => 'Falha na conexão com o banco de dados do tenant'], 500);
+            return response()->json(['error' => 'Falha na conexão com o tenant'], 500);
         }
 
-        try {
-            // Obter informações do banco
-            $connectionDetails = [
-                'driver' => config('database.connections.tenant.driver'),
-                'host' => config('database.connections.tenant.host', '127.0.0.1'),
-                'port' => config('database.connections.tenant.port', '3306'),
-                'database' => $client->database_name,
-                'charset' => config('database.connections.tenant.charset', 'utf8mb4'),
-                'collation' => config('database.connections.tenant.collation', 'utf8mb4_unicode_ci'),
+        $tables = Schema::connection('tenant')->getAllTables();
+        $meta = array_map(function ($t) {
+            $name = is_object($t) ? array_values((array)$t)[0] : $t;
+            return [
+                'table'   => $name,
+                'columns' => Schema::connection('tenant')->getColumnListing($name),
             ];
+        }, $tables);
 
-            // Opcional: Listar tabelas disponíveis no banco
-            $tables = Schema::connection('tenant')->getAllTables();
-            $tableNames = array_map(function ($table) use ($connectionDetails) {
-                $tableName = is_object($table) ? array_values((array)$table)[0] : $table;
-                return [
-                    'table_name' => $tableName,
-                    // Opcional: Listar colunas da tabela
-                    'columns' => Schema::connection('tenant')->getColumnListing($tableName),
-                ];
-            }, $tables);
-
-            Log::info('Informações do banco preparadas para o BI', [
-                'client_id' => $client->id,
-                'database' => $client->database_name,
-                'tables_count' => count($tableNames)
-            ]);
-
-            // Retornar detalhes de conexão e metadados
-            return response()->json([
-                'message' => 'Informações de conexão para o BI obtidas com sucesso.',
-                'connection' => $connectionDetails,
-                'tables' => $tableNames,
-            ]);
-        } catch (\Throwable $e) {
-            Log::error('Erro ao obter informações do banco para o BI', [
-                'client_id' => $client->id ?? 'desconhecido',
-                'erro' => $e->getMessage(),
-                'trace' => $e->getTraceAsString()
-            ]);
-
-            return response()->json([
-                'error' => 'Erro ao obter informações do banco',
-                'details' => 'Verifique os logs do servidor para mais informações'
-            ], 500);
-        }
+        return response()->json([
+            'connection' => config('database.connections.tenant'),
+            'tables'     => $meta,
+        ]);
     }
 }
