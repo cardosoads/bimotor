@@ -120,7 +120,8 @@ class ReceiveDataController extends Controller
                 // Specific fix for numero_fechamento overflow
                 if (Str::lower($col) === 'numero_fechamento') {
                     $t->bigInteger($col)->nullable();
-                } elseif (count($cols) > 50 || in_array(Str::lower($col), ['cfop','cst','ncm','cnpj','cpf'])) {
+                } elseif (count($cols) > 20 || in_array(Str::lower($col), ['cfop','cst','ncm','cnpj','cpf'])) {
+                    // Use TEXT for most cols to avoid row size issues
                     $t->text($col)->nullable();
                 } elseif ($this->isBoolean($val)) {
                     $t->boolean($col)->nullable();
@@ -135,7 +136,8 @@ class ReceiveDataController extends Controller
                 } elseif (is_float($val)) {
                     $t->float($col)->nullable();
                 } else {
-                    $t->string($col, 191)->nullable();
+                    // default to TEXT
+                    $t->text($col)->nullable();
                 }
             }
             $t->timestamps();
@@ -157,7 +159,6 @@ class ReceiveDataController extends Controller
                 if (Str::lower($col) === 'id') continue;
                 $val = $firstRow[$col];
 
-                // Specific fix for numero_fechamento overflow
                 if (Str::lower($col) === 'numero_fechamento') {
                     $t->bigInteger($col)->nullable()->after('id');
                 } elseif (is_numeric($val) && (int)$val > 2147483647) {
@@ -170,12 +171,8 @@ class ReceiveDataController extends Controller
                     $t->dateTime($col)->nullable()->after('id');
                 } elseif ($this->isDate($val)) {
                     $t->date($col)->nullable()->after('id');
-                } elseif (is_int($val)) {
-                    $t->integer($col)->nullable()->after('id');
-                } elseif (is_float($val)) {
-                    $t->float($col)->nullable()->after('id');
-                } else {
-                    $t->string($col, 191)->nullable()->after('id');
+                } elseif (count($new) > 0) {
+                    $t->text($col)->nullable()->after('id');
                 }
             }
         });
