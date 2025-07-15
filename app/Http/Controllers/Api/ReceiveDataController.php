@@ -117,7 +117,10 @@ class ReceiveDataController extends Controller
                 if (Str::lower($col) === 'id') continue;
                 $val = $firstRow[$col];
 
-                if (count($cols) > 50 || in_array(Str::lower($col), ['cfop','cst','ncm','cnpj','cpf'])) {
+                // Specific fix for numero_fechamento overflow
+                if (Str::lower($col) === 'numero_fechamento') {
+                    $t->bigInteger($col)->nullable();
+                } elseif (count($cols) > 50 || in_array(Str::lower($col), ['cfop','cst','ncm','cnpj','cpf'])) {
                     $t->text($col)->nullable();
                 } elseif ($this->isBoolean($val)) {
                     $t->boolean($col)->nullable();
@@ -154,7 +157,10 @@ class ReceiveDataController extends Controller
                 if (Str::lower($col) === 'id') continue;
                 $val = $firstRow[$col];
 
-                if (is_numeric($val) && (int)$val > 2147483647) {
+                // Specific fix for numero_fechamento overflow
+                if (Str::lower($col) === 'numero_fechamento') {
+                    $t->bigInteger($col)->nullable()->after('id');
+                } elseif (is_numeric($val) && (int)$val > 2147483647) {
                     $t->bigInteger($col)->nullable()->after('id');
                 } elseif (in_array(Str::lower($col), ['cfop','cst','ncm','cnpj','cpf'])) {
                     $t->text($col)->nullable()->after('id');
@@ -208,7 +214,7 @@ class ReceiveDataController extends Controller
     }
 
     /**
-     * Guess PK by name.
+     * Guess primary key by name.
      */
     protected function guessPrimaryKey(array $cols, string $table): ?string
     {
