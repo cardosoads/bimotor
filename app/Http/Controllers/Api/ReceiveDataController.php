@@ -16,25 +16,32 @@ class ReceiveDataController extends Controller
 {
     public function store(Request $request)
     {
-        // Decodifica JSON cru para evitar limites de max_input_vars
-        $raw = json_decode($request->getContent(), true);
-        Log::info('Payload bruto recebido', ['tables' => count($raw['payload'] ?? [])]);
+        // Lê JSON via Laravel para garantir payload completo
+        $raw = $request->json()->all();
+        $payloadCount = is_array($raw['payload'] ?? null) ? count($raw['payload']) : 0;
+        Log::info('Payload JSON recebido', ['tables' => $payloadCount]);
 
-        // Log detalhado por tabela
-        foreach ($raw['payload'] ?? [] as $tableName => $rows) {
-            Log::info('Tabela no payload bruto', ['table' => $tableName, 'rows' => count($rows)]);
+        // Se não vier JSON válido, loga o conteúdo bruto
+        if (!$raw) {
+            Log::error('Falha ao decodificar JSON', ['content' => $request->getContent()]);
+            return response()->json(['error' => 'JSON inválido'], 400);
         }
 
-        // Validação após decodificar
+        // Validação do conteúdo JSON
         $validator = Validator::make($raw, [
             'user_identifier' => 'required|string',
-            'payload'         => 'required|array',
-            'payload.*'       => 'array',
+            'payload'         => 'required|array|min:1',
+            'payload.*'       => 'array|min:1',
         ]);
 
-        $data = $validator->validate();
+        if ($validator->fails()) {
+            Log::error('Validação inválida', ['errors' => $validator->errors()->all()]);
+            return response()->json(['errors' => $validator->errors()], 422);
+        }
 
-        // Conecta no tenant
+        $data = $validator->validated();
+
+        // Conecta no tenant apropriado
         $client = Client::where('id', $data['user_identifier'])
             ->orWhere('database_name', $data['user_identifier'])
             ->firstOrFail();
@@ -47,11 +54,12 @@ class ReceiveDataController extends Controller
         try {
             foreach ($data['payload'] as $rawTable => $rows) {
                 $table = $this->sanitizeTableName($rawTable);
-                if (empty($rows)) {
+                $rowCount = is_array($rows) ? count($rows) : 0;
+                if ($rowCount === 0) {
                     continue;
                 }
 
-                Log::info('Processando tabela', ['table' => $table, 'rows' => count($rows)]);
+                Log::info('Processando tabela', ['table' => $table, 'rows' => $rowCount]);
 
                 $columnTypes = $this->inferColumnTypes($rows);
 
@@ -69,30 +77,29 @@ class ReceiveDataController extends Controller
                     $this->createTableWithTypes($table, $columnTypes);
                 }
 
-                DB::connection('tenant')->statement("ALTER TABLE `{$table}` ROW_FORMAT=DYNAMIC");
+                $conn->statement("ALTER TABLE `{$table}` ROW_FORMAT=DYNAMIC");
                 $conn->table($table)->truncate();
 
-                foreach (array_chunk($rows, 500) as $batch) {
+                // Inserções em batch de 1000 para performance
+                foreach (array_chunk($rows, 1000) as $batch) {
                     $conn->table($table)->insert($batch);
                 }
 
-                Log::info('Dados gravados', ['table' => $table, 'count' => count($rows)]);
+                Log::info('Dados gravados', ['table' => $table, 'count' => $rowCount]);
             }
 
             $conn->commit();
             $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
 
-            return response()->json(['message' => 'Sincronização completa']);
+            return response()->json(['message' => 'Sincronização completa', 'tables' => $payloadCount]);
         } catch (\Throwable $e) {
             $conn->rollBack();
             $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
             Log::error('Erro na sincronização', ['error' => $e->getMessage()]);
 
-            return response()->json(['error' => $e->getMessage()], 500);
+            return response()->json(['error' => 'Falha na sincronização', 'details' => $e->getMessage()], 500);
         }
     }
-
-    // ... demais métodos inalterados (inferColumnTypes, createTableWithTypes, etc.)
 
     protected function inferColumnTypes(array $rows): array
     {
@@ -165,5 +172,29 @@ class ReceiveDataController extends Controller
         DB::reconnect('tenant');
     }
 
-    // public function connectBI() permanece inalterado...
+    public function connectBI(Request $request)
+    {
+        Log::info('ReceiveData /connectbi', ['payload' => $request->all()]);
+
+        $data = $request->validate([
+            'user_identifier' => 'required|string',
+            'database_name'   => 'nullable|string',
+        ]);
+
+        $client = Client::where('id', $data['user_identifier'])
+            ->orWhere('database_name', $data['user_identifier'])
+            ->firstOrFail();
+        $this->connectToTenant($client);
+
+        $tables = Schema::connection('tenant')->getAllTables();
+        $meta = array_map(function ($t) {
+            $name = is_object($t) ? array_values((array) $t)[0] : $t;
+            return ['table' => $name, 'columns' => Schema::connection('tenant')->getColumnListing($name)];
+        }, $tables);
+
+        return response()->json([
+            'connection' => config('database.connections.tenant'),
+            'tables'     => $meta,
+        ]);
+    }
 }
