@@ -21,6 +21,9 @@ Route::middleware('auth:sanctum')->group(function () {
     // recebimento de dados
     Route::post('/receive', [ReceiveDataController::class, 'store']);
     Route::get('/received-data', [ReceiveDataController::class, 'index']);
+
+    Route::post('/verify-record', [ReceiveDataController::class, 'verifyRecord']);
+    Route::get('/verify-table/{table}', [ReceiveDataController::class, 'verifyTable']);
 });
 
 Route::middleware('auth:sanctum')->group(function () {

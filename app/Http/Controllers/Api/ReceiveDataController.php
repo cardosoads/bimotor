@@ -197,4 +197,49 @@ class ReceiveDataController extends Controller
             'tables'     => $meta,
         ]);
     }
+
+    public function verifyRecord(Request $request)
+    {
+        $data = $request->validate([
+            'table' => 'required|string',
+            'record_id' => 'required'
+        ]);
+
+        try {
+            $this->connectToTenant(
+                Client::where('id', $request->user_identifier)
+                    ->orWhere('database_name', $request->user_identifier)
+                    ->firstOrFail()
+            );
+
+            $table = $this->sanitizeTableName($data['table']);
+            $exists = DB::connection('tenant')->table($table)->where('id', $data['record_id'])->exists();
+
+            Log::info('Verificação de registro', ['table' => $table, 'record_id' => $data['record_id'], 'exists' => $exists]);
+            return response()->json(['exists' => $exists]);
+        } catch (\Throwable $e) {
+            Log::error('Erro ao verificar registro', ['error' => $e->getMessage()]);
+            return response()->json(['error' => 'Falha na verificação', 'details' => $e->getMessage()], 500);
+        }
+    }
+
+    public function verifyTable($table, Request $request)
+    {
+        try {
+            $this->connectToTenant(
+                Client::where('id', $request->user_identifier)
+                    ->orWhere('database_name', $request->user_identifier)
+                    ->firstOrFail()
+            );
+
+            $table = $this->sanitizeTableName($table);
+            $count = DB::connection('tenant')->table($table)->count();
+
+            Log::info('Verificação de tabela', ['table' => $table, 'count' => $count]);
+            return response()->json(['count' => $count]);
+        } catch (\Throwable $e) {
+            Log::error('Erro ao verificar tabela', ['error' => $e->getMessage()]);
+            return response()->json(['error' => 'Falha na verificação', 'details' => $e->getMessage()], 500);
+        }
+    }
 }
