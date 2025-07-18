@@ -67,7 +67,7 @@ class ReceiveDataController extends Controller
             $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, false);
             $conn->beginTransaction();
 
-            $insertedIds = []; // Para rastrear IDs inseridos
+            $insertedRecords = []; // Para rastrear registros inseridos
 
             foreach ($data['payload'] as $rawTable => $rows) {
                 $table = $this->sanitizeTableName($rawTable);
@@ -112,11 +112,9 @@ class ReceiveDataController extends Controller
                     try {
                         $conn->table($table)->insert($batch);
                         Log::info('Lote inserido', ['table' => $table, 'batch_size' => count($batch)]);
-                        // Rastrear IDs inseridos (se aplicável)
+                        // Rastrear registros inseridos
                         foreach ($batch as $row) {
-                            if (isset($row['id'])) {
-                                $insertedIds[$table][] = $row['id'];
-                            }
+                            $insertedRecords[$table][] = $row; // Armazenar o registro completo
                         }
                     } catch (\Throwable $e) {
                         Log::error('Erro ao inserir lote', [
@@ -135,12 +133,16 @@ class ReceiveDataController extends Controller
             $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
             Log::info('Sincronização concluída com sucesso', [
                 'tables' => $payloadCount,
-                'inserted_ids' => $insertedIds
+                'inserted_records' => array_map(function ($records) {
+                    return array_map(function ($record) {
+                        return array_key_exists('id', $record) ? $record['id'] : 'no_id';
+                    }, $records);
+                }, $insertedRecords)
             ]);
             return response()->json([
                 'message' => 'Sincronização completa',
                 'tables' => $payloadCount,
-                'inserted_ids' => $insertedIds
+                'inserted_records' => $insertedRecords
             ], 200);
         } catch (\Throwable $e) {
             $conn->rollBack();
@@ -166,7 +168,8 @@ class ReceiveDataController extends Controller
             // Validar entrada
             $data = $request->validate([
                 'table' => 'required|string',
-                'record_id' => 'required'
+                'record_id' => 'nullable', // Permitir record_id nulo
+                'unique_key' => 'nullable|array' // Adicionar suporte para chave alternativa
             ]);
 
             // Verificar cliente
@@ -189,23 +192,47 @@ class ReceiveDataController extends Controller
                 return response()->json(['error' => 'Tabela não encontrada', 'exists' => false], 404);
             }
 
-            // Verificar se a coluna 'id' existe
+            // Verificar colunas da tabela
             $columns = Schema::connection('tenant')->getColumnListing($table);
-            if (!in_array('id', $columns)) {
-                Log::error('Coluna "id" não encontrada na tabela', ['table' => $table, 'columns' => $columns]);
-                return response()->json(['error' => 'Coluna "id" não encontrada na tabela', 'exists' => false], 400);
+            Log::info('Colunas da tabela', ['table' => $table, 'columns' => $columns]);
+
+            // Se record_id for fornecido, verificar por id
+            if (isset($data['record_id']) && in_array('id', $columns)) {
+                $exists = $conn->table($table)->where('id', $data['record_id'])->exists();
+                Log::info('Verificação por ID', [
+                    'table' => $table,
+                    'record_id' => $data['record_id'],
+                    'exists' => $exists
+                ]);
+                return response()->json(['exists' => $exists], 200);
             }
 
-            // Verificar se o registro existe
-            $exists = $conn->table($table)->where('id', $data['record_id'])->exists();
+            // Se unique_key for fornecido, verificar por combinação de campos
+            if (isset($data['unique_key']) && is_array($data['unique_key'])) {
+                $query = $conn->table($table);
+                foreach ($data['unique_key'] as $key => $value) {
+                    if (in_array($key, $columns)) {
+                        $query->where($key, $value);
+                    } else {
+                        Log::warning('Coluna não encontrada na tabela', ['table' => $table, 'column' => $key]);
+                    }
+                }
+                $exists = $query->exists();
+                Log::info('Verificação por chave única', [
+                    'table' => $table,
+                    'unique_key' => $data['unique_key'],
+                    'exists' => $exists
+                ]);
+                return response()->json(['exists' => $exists], 200);
+            }
 
-            Log::info('Resultado da verificação de registro', [
+            // Se nenhum critério de verificação for fornecido
+            Log::warning('Nenhum critério de verificação válido fornecido', [
                 'table' => $table,
-                'record_id' => $data['record_id'],
-                'exists' => $exists
+                'record_id' => $data['record_id'] ?? null,
+                'unique_key' => $data['unique_key'] ?? null
             ]);
-
-            return response()->json(['exists' => $exists], 200);
+            return response()->json(['error' => 'Nenhum critério de verificação válido', 'exists' => false], 400);
         } catch (\Illuminate\Validation\ValidationException $e) {
             Log::error('Erro de validação na verificação de registro', [
                 'errors' => $e->errors(),
@@ -248,9 +275,10 @@ class ReceiveDataController extends Controller
             }
 
             $count = DB::connection('tenant')->table($table)->count();
+            $columns = Schema::connection('tenant')->getColumnListing($table);
 
-            Log::info('Verificação de tabela', ['table' => $table, 'count' => $count]);
-            return response()->json(['count' => $count], 200);
+            Log::info('Verificação de tabela', ['table' => $table, 'count' => $count, 'columns' => $columns]);
+            return response()->json(['count' => $count, 'columns' => $columns], 200);
         } catch (\Throwable $e) {
             Log::error('Erro ao verificar tabela', [
                 'error' => $e->getMessage(),
@@ -272,6 +300,7 @@ class ReceiveDataController extends Controller
         foreach ($columns as $col) {
             $maxInt = 0;
             $maxLen = 0;
+            $isDate = false;
             foreach ($rows as $row) {
                 $value = $row[$col] ?? null;
                 if (is_numeric($value) && ctype_digit((string) $value)) {
@@ -279,9 +308,15 @@ class ReceiveDataController extends Controller
                 }
                 if (is_string($value)) {
                     $maxLen = max($maxLen, mb_strlen($value));
+                    // Detectar formato de data
+                    if (preg_match('/^\d{4}-\d{2}-\d{2}(\s\d{2}:\d{2}:\d{2})?$/', $value)) {
+                        $isDate = true;
+                    }
                 }
             }
-            if ($maxInt > 2147483647) {
+            if ($isDate) {
+                $types[$col] = 'datetime';
+            } elseif ($maxInt > 2147483647) {
                 $types[$col] = 'bigInteger';
             } elseif ($maxLen > 191) {
                 $types[$col] = 'text';
@@ -297,7 +332,7 @@ class ReceiveDataController extends Controller
     {
         try {
             Schema::connection('tenant')->create($table, function (Blueprint $t) use ($types) {
-                $t->id();
+                $t->id()->nullable(); // Tornar id opcional
                 foreach ($types as $col => $type) {
                     switch ($type) {
                         case 'bigInteger':
@@ -305,6 +340,9 @@ class ReceiveDataController extends Controller
                             break;
                         case 'text':
                             $t->text($col)->nullable();
+                            break;
+                        case 'datetime':
+                            $t->dateTime($col)->nullable();
                             break;
                         default:
                             $t->string($col, 191)->nullable();
@@ -348,6 +386,8 @@ class ReceiveDataController extends Controller
             ]]);
             DB::purge('tenant');
             DB::reconnect('tenant');
+            // Testar conexão
+            DB::connection('tenant')->getPdo();
             Log::info('Conexão com tenant estabelecida', ['database' => $client->database_name]);
         } catch (\Throwable $e) {
             Log::error('Erro ao conectar ao tenant', [
