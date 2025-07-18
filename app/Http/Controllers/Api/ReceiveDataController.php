@@ -69,11 +69,18 @@ class ReceiveDataController extends Controller
                 Log::error('Cliente não encontrado', ['user_identifier' => $data['user_identifier']]);
                 return response()->json(['error' => 'Cliente não encontrado'], 404);
             }
-            $this->connectToTenant($client);
 
-            $conn = DB::connection('tenant');
+            // Estabelecer conexão com o tenant
+            $conn = $this->connectToTenant($client);
+            if (!$conn) {
+                Log::error('Falha ao conectar ao tenant', ['database' => $client->database_name]);
+                return response()->json(['error' => 'Falha ao conectar ao banco de dados do tenant'], 500);
+            }
+
+            // Iniciar transação
             $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, false);
             $conn->beginTransaction();
+            Log::info('Transação iniciada', ['database' => $client->database_name]);
 
             $insertedRecords = [];
 
@@ -150,6 +157,7 @@ class ReceiveDataController extends Controller
             }
 
             $conn->commit();
+            Log::info('Transação confirmada', ['database' => $client->database_name]);
             $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
             Log::info('Sincronização concluída com sucesso', [
                 'tables' => $payloadCount,
@@ -165,8 +173,13 @@ class ReceiveDataController extends Controller
                 'inserted_records' => $insertedRecords
             ], 200);
         } catch (\Throwable $e) {
-            $conn->rollBack();
-            $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
+            if (isset($conn) && $conn->getPdo()->inTransaction()) {
+                $conn->rollBack();
+                Log::info('Transação revertida', ['database' => $client->database_name ?? 'unknown']);
+            }
+            if (isset($conn)) {
+                $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
+            }
             Log::error('Erro na sincronização', [
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
@@ -322,8 +335,8 @@ class ReceiveDataController extends Controller
             $isDate = false;
             foreach ($rows as $row) {
                 $value = $row[$col] ?? null;
-                if (is_numeric($value) && ctype_digit((string) $value)) {
-                    $maxInt = max($maxInt, (int) $value);
+                if (is_numeric($value) && ctype_digit((string)$value)) {
+                    $maxInt = max($maxInt, (int)$value);
                 }
                 if (is_string($value)) {
                     $maxLen = max($maxLen, mb_strlen($value));
@@ -552,28 +565,35 @@ class ReceiveDataController extends Controller
     protected function connectToTenant(Client $client)
     {
         try {
+            // Configurar a conexão
             config(['database.connections.tenant' => [
-                'driver'    => 'mysql',
-                'host'      => env('DB_HOST', '127.0.0.1'),
-                'port'      => env('DB_PORT', '3306'),
-                'database'  => $client->database_name,
-                'username'  => env('DB_USERNAME'),
-                'password'  => env('DB_PASSWORD'),
-                'charset'   => 'utf8mb4',
+                'driver' => 'mysql',
+                'host' => env('DB_HOST', '127.0.0.1'),
+                'port' => env('DB_PORT', '3306'),
+                'database' => $client->database_name,
+                'username' => env('DB_USERNAME'),
+                'password' => env('DB_PASSWORD'),
+                'charset' => 'utf8mb4',
                 'collation' => 'utf8mb4_unicode_ci',
-                'strict'    => true,
+                'strict' => true,
             ]]);
+
+            // Limpar qualquer conexão anterior
             DB::purge('tenant');
             DB::reconnect('tenant');
-            DB::connection('tenant')->getPdo();
+
+            // Testar a conexão
+            $conn = DB::connection('tenant');
+            $conn->getPdo(); // Forçar a conexão para verificar se está ativa
             Log::info('Conexão com tenant estabelecida', ['database' => $client->database_name]);
+            return $conn;
         } catch (\Throwable $e) {
             Log::error('Erro ao conectar ao tenant', [
                 'database' => $client->database_name,
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString()
             ]);
-            throw $e;
+            return null;
         }
     }
 }
