@@ -40,6 +40,7 @@ class ReceiveDataController extends Controller
             'user_identifier' => 'required|string',
             'payload' => 'required|array|min:1',
             'payload.*' => 'array|min:1',
+            'structure' => 'nullable|array', // Suporte para estrutura da tabela
         ]);
 
         if ($validator->fails()) {
@@ -79,37 +80,18 @@ class ReceiveDataController extends Controller
 
                 Log::info('Processando tabela', ['table' => $table, 'rows' => $rowCount]);
 
-                // Inferir tipos de colunas
-                $columnTypes = $this->inferColumnTypes($rows);
+                // Obter estrutura da tabela, se fornecida
+                $tableStructure = $data['structure'][$rawTable] ?? null;
+
+                // Inferir tipos de colunas a partir dos dados, se a estrutura não for fornecida
+                $columnTypes = $tableStructure ? $this->mapStructureToTypes($tableStructure) : $this->inferColumnTypes($rows);
 
                 // Verificar e ajustar tabela
                 if (!Schema::connection('tenant')->hasTable($table)) {
                     Log::info('Criando nova tabela', ['table' => $table]);
-                    $this->createTableWithTypes($table, $columnTypes);
+                    $this->createTableWithTypes($table, $columnTypes, $tableStructure);
                 } else {
-                    $existingCols = Schema::connection('tenant')->getColumnListing($table);
-                    $newCols = array_keys($columnTypes);
-                    // Adicionar colunas novas, se necessário
-                    Schema::connection('tenant')->table($table, function (Blueprint $t) use ($columnTypes, $existingCols) {
-                        foreach ($columnTypes as $col => $type) {
-                            if (!in_array($col, $existingCols)) {
-                                switch ($type) {
-                                    case 'bigInteger':
-                                        $t->bigInteger($col)->nullable();
-                                        break;
-                                    case 'text':
-                                        $t->text($col)->nullable();
-                                        break;
-                                    case 'datetime':
-                                        $t->dateTime($col)->nullable();
-                                        break;
-                                    default:
-                                        $t->string($col, 191)->nullable();
-                                        break;
-                                }
-                            }
-                        }
-                    });
+                    $this->updateTableSchema($table, $columnTypes, $tableStructure);
                 }
 
                 // Configurar formato da tabela
@@ -119,12 +101,11 @@ class ReceiveDataController extends Controller
                 foreach (array_chunk($rows, 1000) as $batch) {
                     try {
                         $updateColumns = array_keys($batch[0]);
-                        // Remover 'id' das colunas de atualização, pois é a chave primária
                         $updateColumns = array_diff($updateColumns, ['id']);
                         $conn->table($table)->upsert(
                             $batch,
-                            ['id'], // Chave única
-                            $updateColumns // Colunas a atualizar
+                            ['id'],
+                            $updateColumns
                         );
                         Log::info('Lote sincronizado via upsert', ['table' => $table, 'batch_size' => count($batch)]);
                         foreach ($batch as $row) {
@@ -179,14 +160,12 @@ class ReceiveDataController extends Controller
         ]);
 
         try {
-            // Validar entrada
             $data = $request->validate([
                 'table' => 'required|string',
                 'record_id' => 'nullable',
                 'unique_key' => 'nullable|array'
             ]);
 
-            // Verificar cliente
             $client = Client::where('id', $request->user_identifier)
                 ->orWhere('database_name', $request->user_identifier)
                 ->first();
@@ -195,22 +174,18 @@ class ReceiveDataController extends Controller
                 return response()->json(['error' => 'Cliente não encontrado', 'exists' => false], 404);
             }
 
-            // Conectar ao tenant
             $this->connectToTenant($client);
             $conn = DB::connection('tenant');
             $table = $this->sanitizeTableName($data['table']);
 
-            // Verificar se a tabela existe
             if (!Schema::connection('tenant')->hasTable($table)) {
                 Log::error('Tabela não encontrada', ['table' => $table]);
                 return response()->json(['error' => 'Tabela não encontrada', 'exists' => false], 404);
             }
 
-            // Verificar colunas da tabela
             $columns = Schema::connection('tenant')->getColumnListing($table);
             Log::info('Colunas da tabela', ['table' => $table, 'columns' => $columns]);
 
-            // Verificar por ID, se fornecido
             if (!empty($data['record_id']) && in_array('id', $columns)) {
                 $exists = $conn->table($table)->where('id', $data['record_id'])->exists();
                 Log::info('Verificação por ID', [
@@ -221,7 +196,6 @@ class ReceiveDataController extends Controller
                 return response()->json(['exists' => $exists], 200);
             }
 
-            // Verificar por chave única, se fornecida
             if (!empty($data['unique_key']) && is_array($data['unique_key'])) {
                 $query = $conn->table($table);
                 foreach ($data['unique_key'] as $key => $value) {
@@ -240,7 +214,6 @@ class ReceiveDataController extends Controller
                 return response()->json(['exists' => $exists], 200);
             }
 
-            // Retornar erro se nenhum critério válido for fornecido
             Log::warning('Nenhum critério de verificação válido fornecido', [
                 'table' => $table,
                 'record_id' => $data['record_id'] ?? null,
@@ -290,13 +263,19 @@ class ReceiveDataController extends Controller
 
             $count = DB::connection('tenant')->table($table)->count();
             $columns = Schema::connection('tenant')->getColumnListing($table);
+            $columnDetails = $this->getTableStructure($table);
 
             Log::info('Verificação de tabela concluída', [
                 'table' => $table,
                 'count' => $count,
-                'columns' => $columns
+                'columns' => $columns,
+                'structure' => $columnDetails
             ]);
-            return response()->json(['count' => $count, 'columns' => $columns], 200);
+            return response()->json([
+                'count' => $count,
+                'columns' => $columns,
+                'structure' => $columnDetails
+            ], 200);
         } catch (\Throwable $e) {
             Log::error('Erro ao verificar tabela', [
                 'error' => $e->getMessage(),
@@ -345,10 +324,45 @@ class ReceiveDataController extends Controller
         return $types;
     }
 
-    protected function createTableWithTypes(string $table, array $types)
+    protected function mapStructureToTypes(array $structure): array
+    {
+        $types = [];
+        foreach ($structure['columns'] as $column) {
+            $colName = $column['name'];
+            $colType = strtolower($column['type']);
+            switch ($colType) {
+                case 'bigint':
+                    $types[$colName] = 'bigInteger';
+                    break;
+                case 'varchar':
+                case 'char':
+                    $types[$colName] = 'string';
+                    break;
+                case 'text':
+                case 'longtext':
+                    $types[$colName] = 'text';
+                    break;
+                case 'datetime':
+                case 'timestamp':
+                    $types[$colName] = 'datetime';
+                    break;
+                case 'int':
+                case 'integer':
+                    $types[$colName] = 'integer';
+                    break;
+                default:
+                    $types[$colName] = 'string';
+                    break;
+            }
+        }
+        Log::info('Tipos de colunas mapeados a partir da estrutura', ['columns' => $types]);
+        return $types;
+    }
+
+    protected function createTableWithTypes(string $table, array $types, ?array $structure = null)
     {
         try {
-            Schema::connection('tenant')->create($table, function (Blueprint $t) use ($types) {
+            Schema::connection('tenant')->create($table, function (Blueprint $t) use ($types, $structure) {
                 $t->id()->nullable();
                 foreach ($types as $col => $type) {
                     switch ($type) {
@@ -361,6 +375,9 @@ class ReceiveDataController extends Controller
                         case 'datetime':
                             $t->dateTime($col)->nullable();
                             break;
+                        case 'integer':
+                            $t->integer($col)->nullable();
+                            break;
                         default:
                             $t->string($col, 191)->nullable();
                             break;
@@ -368,6 +385,19 @@ class ReceiveDataController extends Controller
                 }
                 $t->timestamps();
                 $t->timestamp('synced_at')->nullable();
+
+                // Adicionar índices, se fornecidos
+                if ($structure && isset($structure['indexes'])) {
+                    foreach ($structure['indexes'] as $index) {
+                        if ($index['type'] === 'primary' && $index['column'] !== 'id') {
+                            $t->primary($index['column']);
+                        } elseif ($index['type'] === 'unique') {
+                            $t->unique($index['column'], $index['name'] ?? null);
+                        } elseif ($index['type'] === 'index') {
+                            $t->index($index['column'], $index['name'] ?? null);
+                        }
+                    }
+                }
             });
             Log::info('Tabela criada com sucesso', ['table' => $table, 'columns' => array_keys($types)]);
         } catch (\Throwable $e) {
@@ -377,6 +407,96 @@ class ReceiveDataController extends Controller
                 'trace' => $e->getTraceAsString()
             ]);
             throw $e;
+        }
+    }
+
+    protected function updateTableSchema(string $table, array $types, ?array $structure = null)
+    {
+        try {
+            $existingCols = Schema::connection('tenant')->getColumnListing($table);
+            Schema::connection('tenant')->table($table, function (Blueprint $t) use ($types, $existingCols, $structure) {
+                foreach ($types as $col => $type) {
+                    if (!in_array($col, $existingCols)) {
+                        switch ($type) {
+                            case 'bigInteger':
+                                $t->bigInteger($col)->nullable();
+                                break;
+                            case 'text':
+                                $t->text($col)->nullable();
+                                break;
+                            case 'datetime':
+                                $t->dateTime($col)->nullable();
+                                break;
+                            case 'integer':
+                                $t->integer($col)->nullable();
+                                break;
+                            default:
+                                $t->string($col, 191)->nullable();
+                                break;
+                        }
+                    }
+                }
+
+                // Adicionar índices, se fornecidos
+                if ($structure && isset($structure['indexes'])) {
+                    foreach ($structure['indexes'] as $index) {
+                        if ($index['type'] === 'unique') {
+                            $t->unique($index['column'], $index['name'] ?? null);
+                        } elseif ($index['type'] === 'index') {
+                            $t->index($index['column'], $index['name'] ?? null);
+                        }
+                    }
+                }
+            });
+            Log::info('Esquema da tabela atualizado', ['table' => $table, 'columns' => array_keys($types)]);
+        } catch (\Throwable $e) {
+            Log::error('Erro ao atualizar esquema da tabela', [
+                'table' => $table,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            throw $e;
+        }
+    }
+
+    protected function getTableStructure(string $table): array
+    {
+        try {
+            $columns = Schema::connection('tenant')->getColumnListing($table);
+            $columnDetails = [];
+            $conn = DB::connection('tenant');
+            $results = $conn->select("SHOW COLUMNS FROM `{$table}`");
+            foreach ($results as $result) {
+                $columnDetails[] = [
+                    'name' => $result->Field,
+                    'type' => $result->Type,
+                    'nullable' => $result->Null === 'YES',
+                    'default' => $result->Default,
+                    'extra' => $result->Extra
+                ];
+            }
+
+            $indexes = $conn->select("SHOW INDEXES FROM `{$table}`");
+            $indexDetails = [];
+            foreach ($indexes as $index) {
+                $indexDetails[] = [
+                    'name' => $index->Key_name,
+                    'type' => $index->Key_name === 'PRIMARY' ? 'primary' : ($index->Non_unique ? 'index' : 'unique'),
+                    'column' => $index->Column_name
+                ];
+            }
+
+            return [
+                'columns' => $columnDetails,
+                'indexes' => $indexDetails
+            ];
+        } catch (\Throwable $e) {
+            Log::error('Erro ao obter estrutura da tabela', [
+                'table' => $table,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            return [];
         }
     }
 
