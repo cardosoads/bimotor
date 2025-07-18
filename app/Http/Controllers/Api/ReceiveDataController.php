@@ -92,23 +92,39 @@ class ReceiveDataController extends Controller
 
                     $columnTypes = $this->mapStructureToTypes($structure);
 
-                    if (Schema::connection('tenant')->hasTable($table)) {
-                        $existingStructure = $this->getTableStructure($table);
-                        if ($this->structuresAreDifferent($structure, $existingStructure)) {
-                            Log::info('Estrutura da tabela diverge, descartando tabela existente', ['table' => $table]);
-                            Schema::connection('tenant')->dropIfExists($table);
-                            $this->createTableWithTypes($table, $columnTypes, $structure);
+                    // Isolar criação/atualização da tabela em um bloco try-catch
+                    try {
+                        if (Schema::connection('tenant')->hasTable($table)) {
+                            $existingStructure = $this->getTableStructure($table);
+                            if ($this->structuresAreDifferent($structure, $existingStructure)) {
+                                Log::info('Estrutura da tabela diverge, descartando tabela existente', ['table' => $table]);
+                                Schema::connection('tenant')->dropIfExists($table);
+                                $this->createTableWithTypes($table, $columnTypes, $structure);
+                            } else {
+                                Log::info('Estrutura da tabela idêntica, atualizando se necessário', ['table' => $table]);
+                                $this->updateTableSchema($table, $columnTypes, $structure);
+                            }
                         } else {
-                            Log::info('Estrutura da tabela idêntica, atualizando se necessário', ['table' => $table]);
-                            $this->updateTableSchema($table, $columnTypes, $structure);
+                            Log::info('Criando nova tabela', ['table' => $table]);
+                            $this->createTableWithTypes($table, $columnTypes, $structure);
                         }
-                    } else {
-                        Log::info('Criando nova tabela', ['table' => $table]);
-                        $this->createTableWithTypes($table, $columnTypes, $structure);
-                    }
 
-                    $conn->statement("ALTER TABLE `{$table}` ROW_FORMAT=DYNAMIC");
-                    Log::info('Estrutura da tabela processada', ['table' => $table]);
+                        // Verificar se a transação ainda está ativa
+                        if (!$conn->getPdo()->inTransaction()) {
+                            Log::error('Transação não está ativa após processar estrutura', ['table' => $table]);
+                            throw new \Exception('Transação interrompida inesperadamente');
+                        }
+
+                        $conn->statement("ALTER TABLE `{$table}` ROW_FORMAT=DYNAMIC");
+                        Log::info('Estrutura da tabela processada', ['table' => $table]);
+                    } catch (\Throwable $e) {
+                        Log::error('Erro ao processar estrutura da tabela', [
+                            'table' => $table,
+                            'error' => $e->getMessage(),
+                            'trace' => $e->getTraceAsString()
+                        ]);
+                        throw $e;
+                    }
                 }
             }
 
@@ -132,6 +148,12 @@ class ReceiveDataController extends Controller
                         Log::info('Criando tabela para dados', ['table' => $table]);
                         $this->createTableWithTypes($table, $columnTypes, $tableStructure);
                         $conn->statement("ALTER TABLE `{$table}` ROW_FORMAT=DYNAMIC");
+                    }
+
+                    // Verificar se a transação ainda está ativa
+                    if (!$conn->getPdo()->inTransaction()) {
+                        Log::error('Transação não está ativa antes de sincronizar dados', ['table' => $table]);
+                        throw new \Exception('Transação interrompida inesperadamente');
                     }
 
                     // Usar upsert para inserir ou atualizar registros
@@ -216,7 +238,7 @@ class ReceiveDataController extends Controller
             DB::reconnect('tenant');
 
             $conn = DB::connection('tenant');
-            $conn->getPdo();
+            $conn->getPdo(); // Testar a conexão
             Log::info('Conexão com tenant estabelecida', ['database' => $client->database_name]);
             return $conn;
         } catch (\Throwable $e) {
