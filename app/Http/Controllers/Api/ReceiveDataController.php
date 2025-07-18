@@ -38,9 +38,12 @@ class ReceiveDataController extends Controller
         // Validação do payload
         $validator = Validator::make($raw, [
             'user_identifier' => 'required|string',
-            'payload' => 'required|array|min:1',
-            'payload.*' => 'array|min:1',
-            'structure' => 'nullable|array', // Suporte para estrutura da tabela
+            'payload' => 'present|array', // Alterado para permitir array vazio
+            'structure' => 'nullable|array',
+            'structure.*.columns' => 'nullable|array',
+            'structure.*.columns.*.name' => 'required_with:structure|string',
+            'structure.*.columns.*.type' => 'required_with:structure|string',
+            'structure.*.indexes' => 'nullable|array'
         ]);
 
         if ($validator->fails()) {
@@ -70,58 +73,76 @@ class ReceiveDataController extends Controller
 
             $insertedRecords = [];
 
-            foreach ($data['payload'] as $rawTable => $rows) {
-                $table = $this->sanitizeTableName($rawTable);
-                $rowCount = is_array($rows) ? count($rows) : 0;
-                if ($rowCount === 0) {
-                    Log::warning('Tabela vazia recebida', ['table' => $table]);
-                    continue;
-                }
+            // Processar estrutura da tabela, se fornecida
+            if (!empty($data['structure'])) {
+                foreach ($data['structure'] as $rawTable => $structure) {
+                    $table = $this->sanitizeTableName($rawTable);
+                    Log::info('Processando estrutura da tabela', ['table' => $table]);
 
-                Log::info('Processando tabela', ['table' => $table, 'rows' => $rowCount]);
+                    $columnTypes = $this->mapStructureToTypes($structure);
 
-                // Obter estrutura da tabela, se fornecida
-                $tableStructure = $data['structure'][$rawTable] ?? null;
-
-                // Inferir tipos de colunas a partir dos dados, se a estrutura não for fornecida
-                $columnTypes = $tableStructure ? $this->mapStructureToTypes($tableStructure) : $this->inferColumnTypes($rows);
-
-                // Verificar e ajustar tabela
-                if (!Schema::connection('tenant')->hasTable($table)) {
-                    Log::info('Criando nova tabela', ['table' => $table]);
-                    $this->createTableWithTypes($table, $columnTypes, $tableStructure);
-                } else {
-                    $this->updateTableSchema($table, $columnTypes, $tableStructure);
-                }
-
-                // Configurar formato da tabela
-                $conn->statement("ALTER TABLE `{$table}` ROW_FORMAT=DYNAMIC");
-
-                // Usar upsert para inserir ou atualizar registros
-                foreach (array_chunk($rows, 1000) as $batch) {
-                    try {
-                        $updateColumns = array_keys($batch[0]);
-                        $updateColumns = array_diff($updateColumns, ['id']);
-                        $conn->table($table)->upsert(
-                            $batch,
-                            ['id'],
-                            $updateColumns
-                        );
-                        Log::info('Lote sincronizado via upsert', ['table' => $table, 'batch_size' => count($batch)]);
-                        foreach ($batch as $row) {
-                            $insertedRecords[$table][] = $row;
-                        }
-                    } catch (\Throwable $e) {
-                        Log::error('Erro ao sincronizar lote', [
-                            'table' => $table,
-                            'error' => $e->getMessage(),
-                            'batch_size' => count($batch)
-                        ]);
-                        throw $e;
+                    if (!Schema::connection('tenant')->hasTable($table)) {
+                        Log::info('Criando nova tabela', ['table' => $table]);
+                        $this->createTableWithTypes($table, $columnTypes, $structure);
+                    } else {
+                        $this->updateTableSchema($table, $columnTypes, $structure);
                     }
-                }
 
-                Log::info('Dados sincronizados', ['table' => $table, 'count' => $rowCount]);
+                    $conn->statement("ALTER TABLE `{$table}` ROW_FORMAT=DYNAMIC");
+                    Log::info('Estrutura da tabela processada', ['table' => $table]);
+                }
+            }
+
+            // Processar dados, se fornecidos
+            if (!empty($data['payload'])) {
+                foreach ($data['payload'] as $rawTable => $rows) {
+                    $table = $this->sanitizeTableName($rawTable);
+                    $rowCount = is_array($rows) ? count($rows) : 0;
+                    if ($rowCount === 0) {
+                        Log::warning('Tabela vazia recebida', ['table' => $table]);
+                        continue;
+                    }
+
+                    Log::info('Processando dados da tabela', ['table' => $table, 'rows' => $rowCount]);
+
+                    $tableStructure = $data['structure'][$rawTable] ?? null;
+                    $columnTypes = $tableStructure ? $this->mapStructureToTypes($tableStructure) : $this->inferColumnTypes($rows);
+
+                    // Garantir que a tabela existe
+                    if (!Schema::connection('tenant')->hasTable($table)) {
+                        Log::info('Criando tabela para dados', ['table' => $table]);
+                        $this->createTableWithTypes($table, $columnTypes, $tableStructure);
+                        $conn->statement("ALTER TABLE `{$table}` ROW_FORMAT=DYNAMIC");
+                    }
+
+                    // Usar upsert para inserir ou atualizar registros
+                    foreach (array_chunk($rows, 1000) as $batch) {
+                        try {
+                            $updateColumns = array_keys($batch[0]);
+                            $updateColumns = array_diff($updateColumns, ['id']);
+                            $conn->table($table)->upsert(
+                                $batch,
+                                ['id'],
+                                $updateColumns
+                            );
+                            Log::info('Lote sincronizado via upsert', ['table' => $table, 'batch_size' => count($batch)]);
+                            foreach ($batch as $row) {
+                                $insertedRecords[$table][] = $row;
+                            }
+                        } catch (\Throwable $e) {
+                            Log::error('Erro ao sincronizar lote', [
+                                'table' => $table,
+                                'error' => $e->getMessage(),
+                                'batch_size' => count($batch)
+                            ]);
+                            throw $e;
+                        }
+                    }
+
+                    Log::info('Dados sincronizados', ['table' => $table, 'count' => $rowCount]);
+                }
+            } else {
+                Log::info('Nenhum dado fornecido, apenas estrutura processada');
             }
 
             $conn->commit();
@@ -262,19 +283,16 @@ class ReceiveDataController extends Controller
             }
 
             $count = DB::connection('tenant')->table($table)->count();
-            $columns = Schema::connection('tenant')->getColumnListing($table);
-            $columnDetails = $this->getTableStructure($table);
+            $structure = $this->getTableStructure($table);
 
             Log::info('Verificação de tabela concluída', [
                 'table' => $table,
                 'count' => $count,
-                'columns' => $columns,
-                'structure' => $columnDetails
+                'structure' => $structure
             ]);
             return response()->json([
                 'count' => $count,
-                'columns' => $columns,
-                'structure' => $columnDetails
+                'structure' => $structure
             ], 200);
         } catch (\Throwable $e) {
             Log::error('Erro ao verificar tabela', [
@@ -330,30 +348,28 @@ class ReceiveDataController extends Controller
         foreach ($structure['columns'] as $column) {
             $colName = $column['name'];
             $colType = strtolower($column['type']);
-            switch ($colType) {
-                case 'bigint':
+            $isNullable = $column['nullable'] ?? true;
+            switch (true) {
+                case str_contains($colType, 'bigint'):
                     $types[$colName] = 'bigInteger';
                     break;
-                case 'varchar':
-                case 'char':
+                case str_contains($colType, 'varchar') || str_contains($colType, 'char'):
                     $types[$colName] = 'string';
                     break;
-                case 'text':
-                case 'longtext':
+                case str_contains($colType, 'text'):
                     $types[$colName] = 'text';
                     break;
-                case 'datetime':
-                case 'timestamp':
+                case str_contains($colType, 'datetime') || str_contains($colType, 'timestamp'):
                     $types[$colName] = 'datetime';
                     break;
-                case 'int':
-                case 'integer':
+                case str_contains($colType, 'int'):
                     $types[$colName] = 'integer';
                     break;
                 default:
                     $types[$colName] = 'string';
                     break;
             }
+            $types[$colName . '_nullable'] = $isNullable;
         }
         Log::info('Tipos de colunas mapeados a partir da estrutura', ['columns' => $types]);
         return $types;
@@ -365,22 +381,27 @@ class ReceiveDataController extends Controller
             Schema::connection('tenant')->create($table, function (Blueprint $t) use ($types, $structure) {
                 $t->id()->nullable();
                 foreach ($types as $col => $type) {
+                    $isNullable = $types[$col . '_nullable'] ?? true;
+                    $column = null;
                     switch ($type) {
                         case 'bigInteger':
-                            $t->bigInteger($col)->nullable();
+                            $column = $t->bigInteger($col);
                             break;
                         case 'text':
-                            $t->text($col)->nullable();
+                            $column = $t->text($col);
                             break;
                         case 'datetime':
-                            $t->dateTime($col)->nullable();
+                            $column = $t->dateTime($col);
                             break;
                         case 'integer':
-                            $t->integer($col)->nullable();
+                            $column = $t->integer($col);
                             break;
                         default:
-                            $t->string($col, 191)->nullable();
+                            $column = $t->string($col, 191);
                             break;
+                    }
+                    if ($isNullable) {
+                        $column->nullable();
                     }
                 }
                 $t->timestamps();
@@ -417,22 +438,27 @@ class ReceiveDataController extends Controller
             Schema::connection('tenant')->table($table, function (Blueprint $t) use ($types, $existingCols, $structure) {
                 foreach ($types as $col => $type) {
                     if (!in_array($col, $existingCols)) {
+                        $isNullable = $types[$col . '_nullable'] ?? true;
+                        $column = null;
                         switch ($type) {
                             case 'bigInteger':
-                                $t->bigInteger($col)->nullable();
+                                $column = $t->bigInteger($col);
                                 break;
                             case 'text':
-                                $t->text($col)->nullable();
+                                $column = $t->text($col);
                                 break;
                             case 'datetime':
-                                $t->dateTime($col)->nullable();
+                                $column = $t->dateTime($col);
                                 break;
                             case 'integer':
-                                $t->integer($col)->nullable();
+                                $column = $t->integer($col);
                                 break;
                             default:
-                                $t->string($col, 191)->nullable();
+                                $column = $t->string($col, 191);
                                 break;
+                        }
+                        if ($isNullable) {
+                            $column->nullable();
                         }
                     }
                 }
