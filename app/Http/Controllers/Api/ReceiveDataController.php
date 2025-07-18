@@ -88,15 +88,23 @@ class ReceiveDataController extends Controller
             if (!empty($data['structure'])) {
                 foreach ($data['structure'] as $rawTable => $structure) {
                     $table = $this->sanitizeTableName($rawTable);
-                    Log::info('Processando estrutura da tabela', ['table' => $table]);
+                    Log::info('Processando estrutura da tabela', ['table' => $table, 'structure' => $structure]);
 
                     $columnTypes = $this->mapStructureToTypes($structure);
 
-                    if (!Schema::connection('tenant')->hasTable($table)) {
+                    if (Schema::connection('tenant')->hasTable($table)) {
+                        $existingStructure = $this->getTableStructure($table);
+                        if ($this->structuresAreDifferent($structure, $existingStructure)) {
+                            Log::info('Estrutura da tabela diverge, descartando tabela existente', ['table' => $table]);
+                            Schema::connection('tenant')->dropIfExists($table);
+                            $this->createTableWithTypes($table, $columnTypes, $structure);
+                        } else {
+                            Log::info('Estrutura da tabela idêntica, atualizando se necessário', ['table' => $table]);
+                            $this->updateTableSchema($table, $columnTypes, $structure);
+                        }
+                    } else {
                         Log::info('Criando nova tabela', ['table' => $table]);
                         $this->createTableWithTypes($table, $columnTypes, $structure);
-                    } else {
-                        $this->updateTableSchema($table, $columnTypes, $structure);
                     }
 
                     $conn->statement("ALTER TABLE `{$table}` ROW_FORMAT=DYNAMIC");
@@ -189,134 +197,35 @@ class ReceiveDataController extends Controller
         }
     }
 
-    public function verifyRecord(Request $request)
+    protected function connectToTenant(Client $client)
     {
-        Log::info('Recebendo requisição de verificação de registro', [
-            'ip' => $request->ip(),
-            'payload' => $request->all(),
-            'headers' => $request->headers->all()
-        ]);
-
         try {
-            $data = $request->validate([
-                'table' => 'required|string',
-                'record_id' => 'nullable',
-                'unique_key' => 'nullable|array'
-            ]);
+            config(['database.connections.tenant' => [
+                'driver'    => 'mysql',
+                'host'      => env('DB_HOST', '127.0.0.1'),
+                'port'      => env('DB_PORT', '3306'),
+                'database'  => $client->database_name,
+                'username'  => env('DB_USERNAME'),
+                'password'  => env('DB_PASSWORD'),
+                'charset'   => 'utf8mb4',
+                'collation' => 'utf8mb4_unicode_ci',
+                'strict'    => true,
+            ]]);
 
-            $client = Client::where('id', $request->user_identifier)
-                ->orWhere('database_name', $request->user_identifier)
-                ->first();
-            if (!$client) {
-                Log::error('Cliente não encontrado', ['user_identifier' => $request->user_identifier]);
-                return response()->json(['error' => 'Cliente não encontrado', 'exists' => false], 404);
-            }
+            DB::purge('tenant');
+            DB::reconnect('tenant');
 
-            $this->connectToTenant($client);
             $conn = DB::connection('tenant');
-            $table = $this->sanitizeTableName($data['table']);
-
-            if (!Schema::connection('tenant')->hasTable($table)) {
-                Log::error('Tabela não encontrada', ['table' => $table]);
-                return response()->json(['error' => 'Tabela não encontrada', 'exists' => false], 404);
-            }
-
-            $columns = Schema::connection('tenant')->getColumnListing($table);
-            Log::info('Colunas da tabela', ['table' => $table, 'columns' => $columns]);
-
-            if (!empty($data['record_id']) && in_array('id', $columns)) {
-                $exists = $conn->table($table)->where('id', $data['record_id'])->exists();
-                Log::info('Verificação por ID', [
-                    'table' => $table,
-                    'record_id' => $data['record_id'],
-                    'exists' => $exists
-                ]);
-                return response()->json(['exists' => $exists], 200);
-            }
-
-            if (!empty($data['unique_key']) && is_array($data['unique_key'])) {
-                $query = $conn->table($table);
-                foreach ($data['unique_key'] as $key => $value) {
-                    if (in_array($key, $columns)) {
-                        $query->where($key, $value);
-                    } else {
-                        Log::warning('Coluna não encontrada na tabela', ['table' => $table, 'column' => $key]);
-                    }
-                }
-                $exists = $query->exists();
-                Log::info('Verificação por chave única', [
-                    'table' => $table,
-                    'unique_key' => $data['unique_key'],
-                    'exists' => $exists
-                ]);
-                return response()->json(['exists' => $exists], 200);
-            }
-
-            Log::warning('Nenhum critério de verificação válido fornecido', [
-                'table' => $table,
-                'record_id' => $data['record_id'] ?? null,
-                'unique_key' => $data['unique_key'] ?? null
-            ]);
-            return response()->json(['error' => 'Nenhum critério de verificação válido', 'exists' => false], 400);
-        } catch (\Illuminate\Validation\ValidationException $e) {
-            Log::error('Erro de validação na verificação de registro', [
-                'errors' => $e->errors(),
-                'payload' => $request->all()
-            ]);
-            return response()->json(['error' => 'Validação inválida', 'details' => $e->errors()], 422);
+            $conn->getPdo();
+            Log::info('Conexão com tenant estabelecida', ['database' => $client->database_name]);
+            return $conn;
         } catch (\Throwable $e) {
-            Log::error('Erro ao verificar registro', [
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
-                'payload' => $request->all()
-            ]);
-            return response()->json(['error' => 'Falha na verificação', 'details' => $e->getMessage()], 500);
-        }
-    }
-
-    public function verifyTable($table, Request $request)
-    {
-        Log::info('Recebendo requisição de verificação de tabela', [
-            'ip' => $request->ip(),
-            'table' => $table,
-            'user_identifier' => $request->user_identifier
-        ]);
-
-        try {
-            $client = Client::where('id', $request->user_identifier)
-                ->orWhere('database_name', $request->user_identifier)
-                ->first();
-            if (!$client) {
-                Log::error('Cliente não encontrado', ['user_identifier' => $request->user_identifier]);
-                return response()->json(['error' => 'Cliente não encontrado', 'count' => 0], 404);
-            }
-
-            $this->connectToTenant($client);
-            $table = $this->sanitizeTableName($table);
-
-            if (!Schema::connection('tenant')->hasTable($table)) {
-                Log::error('Tabela não encontrada', ['table' => $table]);
-                return response()->json(['error' => 'Tabela não encontrada', 'count' => 0], 404);
-            }
-
-            $count = DB::connection('tenant')->table($table)->count();
-            $structure = $this->getTableStructure($table);
-
-            Log::info('Verificação de tabela concluída', [
-                'table' => $table,
-                'count' => $count,
-                'structure' => $structure
-            ]);
-            return response()->json([
-                'count' => $count,
-                'structure' => $structure
-            ], 200);
-        } catch (\Throwable $e) {
-            Log::error('Erro ao verificar tabela', [
+            Log::error('Erro ao conectar ao tenant', [
+                'database' => $client->database_name,
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString()
             ]);
-            return response()->json(['error' => 'Falha na verificação', 'details' => $e->getMessage()], 500);
+            return null;
         }
     }
 
@@ -335,8 +244,8 @@ class ReceiveDataController extends Controller
             $isDate = false;
             foreach ($rows as $row) {
                 $value = $row[$col] ?? null;
-                if (is_numeric($value) && ctype_digit((string)$value)) {
-                    $maxInt = max($maxInt, (int)$value);
+                if (is_numeric($value) && ctype_digit((string) $value)) {
+                    $maxInt = max($maxInt, (int) $value);
                 }
                 if (is_string($value)) {
                     $maxLen = max($maxLen, mb_strlen($value));
@@ -397,7 +306,6 @@ class ReceiveDataController extends Controller
     {
         try {
             Schema::connection('tenant')->create($table, function (Blueprint $t) use ($types, $structure) {
-                // Adicionar coluna 'id' apenas se não estiver na estrutura fornecida
                 $hasIdColumn = array_key_exists('id', $types);
                 if (!$hasIdColumn) {
                     $t->id()->nullable();
@@ -436,12 +344,13 @@ class ReceiveDataController extends Controller
                 // Adicionar índices, se fornecidos
                 if ($structure && isset($structure['indexes'])) {
                     foreach ($structure['indexes'] as $index) {
+                        $indexName = $index['name'] ?? $this->generateIndexName($table, $index['column'], $index['type']);
                         if ($index['type'] === 'primary' && $index['column'] !== 'id') {
-                            $t->primary($index['column']);
+                            $t->primary($index['column'], $indexName);
                         } elseif ($index['type'] === 'unique') {
-                            $t->unique($index['column'], $index['name'] ?? null);
+                            $t->unique($index['column'], $indexName);
                         } elseif ($index['type'] === 'index') {
-                            $t->index($index['column'], $index['name'] ?? null);
+                            $t->index($index['column'], $indexName);
                         }
                     }
                 }
@@ -495,10 +404,11 @@ class ReceiveDataController extends Controller
                 // Adicionar índices, se fornecidos
                 if ($structure && isset($structure['indexes'])) {
                     foreach ($structure['indexes'] as $index) {
-                        if ($index['type'] === 'unique') {
-                            $t->unique($index['column'], $index['name'] ?? null);
-                        } elseif ($index['type'] === 'index') {
-                            $t->index($index['column'], $index['name'] ?? null);
+                        $indexName = $index['name'] ?? $this->generateIndexName($table, $index['column'], $index['type']);
+                        if ($index['type'] === 'unique' && !$this->indexExists($table, $indexName)) {
+                            $t->unique($index['column'], $indexName);
+                        } elseif ($index['type'] === 'index' && !$this->indexExists($table, $indexName)) {
+                            $t->index($index['column'], $indexName);
                         }
                     }
                 }
@@ -555,45 +465,82 @@ class ReceiveDataController extends Controller
         }
     }
 
+    protected function structuresAreDifferent(array $newStructure, array $existingStructure): bool
+    {
+        // Comparar colunas
+        $newColumns = collect($newStructure['columns'] ?? [])->sortBy('name')->values()->toArray();
+        $existingColumns = collect($existingStructure['columns'] ?? [])->sortBy('name')->values()->toArray();
+
+        if (count($newColumns) !== count($existingColumns)) {
+            Log::info('Diferença detectada: número de colunas', [
+                'new_count' => count($newColumns),
+                'existing_count' => count($existingColumns)
+            ]);
+            return true;
+        }
+
+        foreach ($newColumns as $index => $newCol) {
+            $existingCol = $existingColumns[$index] ?? null;
+            if (!$existingCol || $newCol['name'] !== $existingCol['name'] || $newCol['type'] !== $existingCol['type'] || $newCol['nullable'] !== $existingCol['nullable']) {
+                Log::info('Diferença detectada nas colunas', [
+                    'new_column' => $newCol,
+                    'existing_column' => $existingCol
+                ]);
+                return true;
+            }
+        }
+
+        // Comparar índices
+        $newIndexes = collect($newStructure['indexes'] ?? [])->sortBy('name')->values()->toArray();
+        $existingIndexes = collect($existingStructure['indexes'] ?? [])->sortBy('name')->values()->toArray();
+
+        if (count($newIndexes) !== count($existingIndexes)) {
+            Log::info('Diferença detectada: número de índices', [
+                'new_count' => count($newIndexes),
+                'existing_count' => count($existingIndexes)
+            ]);
+            return true;
+        }
+
+        foreach ($newIndexes as $index => $newIdx) {
+            $existingIdx = $existingIndexes[$index] ?? null;
+            if (!$existingIdx || $newIdx['name'] !== $existingIdx['name'] || $newIdx['type'] !== $existingIdx['type'] || $newIdx['column'] !== $existingIdx['column']) {
+                Log::info('Diferença detectada nos índices', [
+                    'new_index' => $newIdx,
+                    'existing_index' => $existingIdx
+                ]);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    protected function indexExists(string $table, string $indexName): bool
+    {
+        try {
+            $indexes = DB::connection('tenant')->select("SHOW INDEXES FROM `{$table}` WHERE Key_name = ?", [$indexName]);
+            return !empty($indexes);
+        } catch (\Throwable $e) {
+            Log::error('Erro ao verificar existência de índice', [
+                'table' => $table,
+                'index_name' => $indexName,
+                'error' => $e->getMessage()
+            ]);
+            return false;
+        }
+    }
+
+    protected function generateIndexName(string $table, string $column, string $type): string
+    {
+        $prefix = $type === 'primary' ? 'pk' : ($type === 'unique' ? 'uniq' : 'idx');
+        return Str::slug("{$table}_{$column}_{$prefix}");
+    }
+
     protected function sanitizeTableName(string $name): string
     {
         $sanitized = preg_replace('/[^a-zA-Z0-9_]/', '', $name);
         Log::info('Sanitização de nome de tabela', ['original' => $name, 'sanitized' => $sanitized]);
         return $sanitized;
-    }
-
-    protected function connectToTenant(Client $client)
-    {
-        try {
-            // Configurar a conexão
-            config(['database.connections.tenant' => [
-                'driver' => 'mysql',
-                'host' => env('DB_HOST', '127.0.0.1'),
-                'port' => env('DB_PORT', '3306'),
-                'database' => $client->database_name,
-                'username' => env('DB_USERNAME'),
-                'password' => env('DB_PASSWORD'),
-                'charset' => 'utf8mb4',
-                'collation' => 'utf8mb4_unicode_ci',
-                'strict' => true,
-            ]]);
-
-            // Limpar qualquer conexão anterior
-            DB::purge('tenant');
-            DB::reconnect('tenant');
-
-            // Testar a conexão
-            $conn = DB::connection('tenant');
-            $conn->getPdo(); // Forçar a conexão para verificar se está ativa
-            Log::info('Conexão com tenant estabelecida', ['database' => $client->database_name]);
-            return $conn;
-        } catch (\Throwable $e) {
-            Log::error('Erro ao conectar ao tenant', [
-                'database' => $client->database_name,
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString()
-            ]);
-            return null;
-        }
     }
 }
