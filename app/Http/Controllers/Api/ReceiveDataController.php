@@ -67,7 +67,7 @@ class ReceiveDataController extends Controller
             $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, false);
             $conn->beginTransaction();
 
-            $insertedRecords = []; // Para rastrear registros inseridos
+            $insertedRecords = [];
 
             foreach ($data['payload'] as $rawTable => $rows) {
                 $table = $this->sanitizeTableName($rawTable);
@@ -82,42 +82,56 @@ class ReceiveDataController extends Controller
                 // Inferir tipos de colunas
                 $columnTypes = $this->inferColumnTypes($rows);
 
-                // Verificar e criar/recriar tabela
-                if (Schema::connection('tenant')->hasTable($table)) {
-                    $existingCols = Schema::connection('tenant')->getColumnListing($table);
-                    $newCols = array_keys($columnTypes);
-                    sort($existingCols);
-                    sort($newCols);
-
-                    if ($existingCols !== $newCols) {
-                        Log::info('Recriando tabela devido a colunas diferentes', [
-                            'table' => $table,
-                            'existing_columns' => $existingCols,
-                            'new_columns' => $newCols
-                        ]);
-                        Schema::connection('tenant')->dropIfExists($table);
-                        $this->createTableWithTypes($table, $columnTypes);
-                    }
-                } else {
+                // Verificar e ajustar tabela
+                if (!Schema::connection('tenant')->hasTable($table)) {
                     Log::info('Criando nova tabela', ['table' => $table]);
                     $this->createTableWithTypes($table, $columnTypes);
+                } else {
+                    $existingCols = Schema::connection('tenant')->getColumnListing($table);
+                    $newCols = array_keys($columnTypes);
+                    // Adicionar colunas novas, se necessário
+                    Schema::connection('tenant')->table($table, function (Blueprint $t) use ($columnTypes, $existingCols) {
+                        foreach ($columnTypes as $col => $type) {
+                            if (!in_array($col, $existingCols)) {
+                                switch ($type) {
+                                    case 'bigInteger':
+                                        $t->bigInteger($col)->nullable();
+                                        break;
+                                    case 'text':
+                                        $t->text($col)->nullable();
+                                        break;
+                                    case 'datetime':
+                                        $t->dateTime($col)->nullable();
+                                        break;
+                                    default:
+                                        $t->string($col, 191)->nullable();
+                                        break;
+                                }
+                            }
+                        }
+                    });
                 }
 
                 // Configurar formato da tabela
                 $conn->statement("ALTER TABLE `{$table}` ROW_FORMAT=DYNAMIC");
-                $conn->table($table)->truncate();
 
-                // Inserir dados em lotes
+                // Usar upsert para inserir ou atualizar registros
                 foreach (array_chunk($rows, 1000) as $batch) {
                     try {
-                        $conn->table($table)->insert($batch);
-                        Log::info('Lote inserido', ['table' => $table, 'batch_size' => count($batch)]);
-                        // Rastrear registros inseridos
+                        $updateColumns = array_keys($batch[0]);
+                        // Remover 'id' das colunas de atualização, pois é a chave primária
+                        $updateColumns = array_diff($updateColumns, ['id']);
+                        $conn->table($table)->upsert(
+                            $batch,
+                            ['id'], // Chave única
+                            $updateColumns // Colunas a atualizar
+                        );
+                        Log::info('Lote sincronizado via upsert', ['table' => $table, 'batch_size' => count($batch)]);
                         foreach ($batch as $row) {
-                            $insertedRecords[$table][] = $row; // Armazenar o registro completo
+                            $insertedRecords[$table][] = $row;
                         }
                     } catch (\Throwable $e) {
-                        Log::error('Erro ao inserir lote', [
+                        Log::error('Erro ao sincronizar lote', [
                             'table' => $table,
                             'error' => $e->getMessage(),
                             'batch_size' => count($batch)
@@ -126,7 +140,7 @@ class ReceiveDataController extends Controller
                     }
                 }
 
-                Log::info('Dados gravados', ['table' => $table, 'count' => $rowCount]);
+                Log::info('Dados sincronizados', ['table' => $table, 'count' => $rowCount]);
             }
 
             $conn->commit();
@@ -168,8 +182,8 @@ class ReceiveDataController extends Controller
             // Validar entrada
             $data = $request->validate([
                 'table' => 'required|string',
-                'record_id' => 'nullable', // Permitir record_id nulo
-                'unique_key' => 'nullable|array' // Adicionar suporte para chave alternativa
+                'record_id' => 'nullable',
+                'unique_key' => 'nullable|array'
             ]);
 
             // Verificar cliente
@@ -196,8 +210,8 @@ class ReceiveDataController extends Controller
             $columns = Schema::connection('tenant')->getColumnListing($table);
             Log::info('Colunas da tabela', ['table' => $table, 'columns' => $columns]);
 
-            // Se record_id for fornecido, verificar por id
-            if (isset($data['record_id']) && in_array('id', $columns)) {
+            // Verificar por ID, se fornecido
+            if (!empty($data['record_id']) && in_array('id', $columns)) {
                 $exists = $conn->table($table)->where('id', $data['record_id'])->exists();
                 Log::info('Verificação por ID', [
                     'table' => $table,
@@ -207,8 +221,8 @@ class ReceiveDataController extends Controller
                 return response()->json(['exists' => $exists], 200);
             }
 
-            // Se unique_key for fornecido, verificar por combinação de campos
-            if (isset($data['unique_key']) && is_array($data['unique_key'])) {
+            // Verificar por chave única, se fornecida
+            if (!empty($data['unique_key']) && is_array($data['unique_key'])) {
                 $query = $conn->table($table);
                 foreach ($data['unique_key'] as $key => $value) {
                     if (in_array($key, $columns)) {
@@ -226,7 +240,7 @@ class ReceiveDataController extends Controller
                 return response()->json(['exists' => $exists], 200);
             }
 
-            // Se nenhum critério de verificação for fornecido
+            // Retornar erro se nenhum critério válido for fornecido
             Log::warning('Nenhum critério de verificação válido fornecido', [
                 'table' => $table,
                 'record_id' => $data['record_id'] ?? null,
@@ -263,7 +277,7 @@ class ReceiveDataController extends Controller
                 ->first();
             if (!$client) {
                 Log::error('Cliente não encontrado', ['user_identifier' => $request->user_identifier]);
-                return response()->json(['error' => 'Cliente não encontrado'], 404);
+                return response()->json(['error' => 'Cliente não encontrado', 'count' => 0], 404);
             }
 
             $this->connectToTenant($client);
@@ -277,7 +291,11 @@ class ReceiveDataController extends Controller
             $count = DB::connection('tenant')->table($table)->count();
             $columns = Schema::connection('tenant')->getColumnListing($table);
 
-            Log::info('Verificação de tabela', ['table' => $table, 'count' => $count, 'columns' => $columns]);
+            Log::info('Verificação de tabela concluída', [
+                'table' => $table,
+                'count' => $count,
+                'columns' => $columns
+            ]);
             return response()->json(['count' => $count, 'columns' => $columns], 200);
         } catch (\Throwable $e) {
             Log::error('Erro ao verificar tabela', [
@@ -308,7 +326,6 @@ class ReceiveDataController extends Controller
                 }
                 if (is_string($value)) {
                     $maxLen = max($maxLen, mb_strlen($value));
-                    // Detectar formato de data
                     if (preg_match('/^\d{4}-\d{2}-\d{2}(\s\d{2}:\d{2}:\d{2})?$/', $value)) {
                         $isDate = true;
                     }
@@ -332,7 +349,7 @@ class ReceiveDataController extends Controller
     {
         try {
             Schema::connection('tenant')->create($table, function (Blueprint $t) use ($types) {
-                $t->id()->nullable(); // Tornar id opcional
+                $t->id()->nullable();
                 foreach ($types as $col => $type) {
                     switch ($type) {
                         case 'bigInteger':
@@ -386,7 +403,6 @@ class ReceiveDataController extends Controller
             ]]);
             DB::purge('tenant');
             DB::reconnect('tenant');
-            // Testar conexão
             DB::connection('tenant')->getPdo();
             Log::info('Conexão com tenant estabelecida', ['database' => $client->database_name]);
         } catch (\Throwable $e) {
