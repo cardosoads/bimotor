@@ -38,12 +38,16 @@ class ReceiveDataController extends Controller
         // Validação do payload
         $validator = Validator::make($raw, [
             'user_identifier' => 'required|string',
-            'payload' => 'present|array', // Alterado para permitir array vazio
+            'payload' => 'present|array',
             'structure' => 'nullable|array',
             'structure.*.columns' => 'nullable|array',
             'structure.*.columns.*.name' => 'required_with:structure|string',
             'structure.*.columns.*.type' => 'required_with:structure|string',
-            'structure.*.indexes' => 'nullable|array'
+            'structure.*.columns.*.nullable' => 'boolean',
+            'structure.*.indexes' => 'nullable|array',
+            'structure.*.indexes.*.type' => 'in:primary,unique,index',
+            'structure.*.indexes.*.column' => 'required_with:structure.*.indexes|string',
+            'structure.*.indexes.*.name' => 'nullable|string'
         ]);
 
         if ($validator->fails()) {
@@ -337,6 +341,7 @@ class ReceiveDataController extends Controller
             } else {
                 $types[$col] = 'string';
             }
+            $types[$col . '_nullable'] = true;
         }
         Log::info('Tipos de colunas inferidos', ['columns' => $types]);
         return $types;
@@ -379,8 +384,16 @@ class ReceiveDataController extends Controller
     {
         try {
             Schema::connection('tenant')->create($table, function (Blueprint $t) use ($types, $structure) {
-                $t->id()->nullable();
+                // Adicionar coluna 'id' apenas se não estiver na estrutura fornecida
+                $hasIdColumn = array_key_exists('id', $types);
+                if (!$hasIdColumn) {
+                    $t->id()->nullable();
+                }
+
                 foreach ($types as $col => $type) {
+                    if (str_ends_with($col, '_nullable')) {
+                        continue;
+                    }
                     $isNullable = $types[$col . '_nullable'] ?? true;
                     $column = null;
                     switch ($type) {
@@ -437,6 +450,9 @@ class ReceiveDataController extends Controller
             $existingCols = Schema::connection('tenant')->getColumnListing($table);
             Schema::connection('tenant')->table($table, function (Blueprint $t) use ($types, $existingCols, $structure) {
                 foreach ($types as $col => $type) {
+                    if (str_ends_with($col, '_nullable')) {
+                        continue;
+                    }
                     if (!in_array($col, $existingCols)) {
                         $isNullable = $types[$col . '_nullable'] ?? true;
                         $column = null;
