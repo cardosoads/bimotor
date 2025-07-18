@@ -16,46 +16,55 @@ class ReceiveDataController extends Controller
 {
     public function store(Request $request)
     {
-        // Lê JSON via Laravel para garantir payload completo
+        Log::info('Recebendo requisição', [
+            'ip' => $request->ip(),
+            'headers' => $request->headers->all(),
+            'payload' => $request->all()
+        ]);
+
         $raw = $request->json()->all();
         $payloadCount = is_array($raw['payload'] ?? null) ? count($raw['payload']) : 0;
         Log::info('Payload JSON recebido', ['tables' => $payloadCount]);
 
-        // Se não vier JSON válido, loga o conteúdo bruto
-        if (!$raw) {
-            Log::error('Falha ao decodificar JSON', ['content' => $request->getContent()]);
+        if (empty($raw)) {
+            Log::error('Falha ao decodificar JSON', [
+                'content' => $request->getContent(),
+                'headers' => $request->headers->all()
+            ]);
             return response()->json(['error' => 'JSON inválido'], 400);
         }
 
-        // Validação do conteúdo JSON
         $validator = Validator::make($raw, [
             'user_identifier' => 'required|string',
-            'payload'         => 'required|array|min:1',
-            'payload.*'       => 'array|min:1',
+            'payload' => 'required|array|min:1',
+            'payload.*' => 'array|min:1',
         ]);
 
         if ($validator->fails()) {
-            Log::error('Validação inválida', ['errors' => $validator->errors()->all()]);
+            Log::error('Validação inválida', [
+                'errors' => $validator->errors()->all(),
+                'payload' => $raw
+            ]);
             return response()->json(['errors' => $validator->errors()], 422);
         }
 
         $data = $validator->validated();
 
-        // Conecta no tenant apropriado
-        $client = Client::where('id', $data['user_identifier'])
-            ->orWhere('database_name', $data['user_identifier'])
-            ->firstOrFail();
-        $this->connectToTenant($client);
-
-        $conn = DB::connection('tenant');
-        $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, false);
-        $conn->beginTransaction();
-
         try {
+            $client = Client::where('id', $data['user_identifier'])
+                ->orWhere('database_name', $data['user_identifier'])
+                ->firstOrFail();
+            $this->connectToTenant($client);
+
+            $conn = DB::connection('tenant');
+            $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, false);
+            $conn->beginTransaction();
+
             foreach ($data['payload'] as $rawTable => $rows) {
                 $table = $this->sanitizeTableName($rawTable);
                 $rowCount = is_array($rows) ? count($rows) : 0;
                 if ($rowCount === 0) {
+                    Log::warning('Tabela vazia recebida', ['table' => $table]);
                     continue;
                 }
 
@@ -70,19 +79,21 @@ class ReceiveDataController extends Controller
                     sort($newCols);
 
                     if ($existingCols !== $newCols) {
+                        Log::info('Recriando tabela devido a colunas diferentes', ['table' => $table]);
                         Schema::connection('tenant')->dropIfExists($table);
                         $this->createTableWithTypes($table, $columnTypes);
                     }
                 } else {
+                    Log::info('Criando nova tabela', ['table' => $table]);
                     $this->createTableWithTypes($table, $columnTypes);
                 }
 
                 $conn->statement("ALTER TABLE `{$table}` ROW_FORMAT=DYNAMIC");
                 $conn->table($table)->truncate();
 
-                // Inserções em batch de 1000 para performance
                 foreach (array_chunk($rows, 1000) as $batch) {
                     $conn->table($table)->insert($batch);
+                    Log::info('Lote inserido', ['table' => $table, 'batch_size' => count($batch)]);
                 }
 
                 Log::info('Dados gravados', ['table' => $table, 'count' => $rowCount]);
@@ -90,13 +101,16 @@ class ReceiveDataController extends Controller
 
             $conn->commit();
             $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
-
+            Log::info('Sincronização concluída com sucesso', ['tables' => $payloadCount]);
             return response()->json(['message' => 'Sincronização completa', 'tables' => $payloadCount]);
         } catch (\Throwable $e) {
             $conn->rollBack();
             $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
-            Log::error('Erro na sincronização', ['error' => $e->getMessage()]);
-
+            Log::error('Erro na sincronização', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+                'payload' => $raw
+            ]);
             return response()->json(['error' => 'Falha na sincronização', 'details' => $e->getMessage()], 500);
         }
     }
