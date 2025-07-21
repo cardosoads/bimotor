@@ -13,15 +13,9 @@ use Illuminate\Support\Str;
 
 class ReceiveDataController extends Controller
 {
-    /**
-     * Store incoming data payload into the client-specific database.
-     */
     public function store(Request $request)
     {
-        Log::info('Requisição /receive', [
-            'payload' => $request->all(),
-            'headers' => $request->headers->all(),
-        ]);
+        Log::info('Requisição /receive', ['payload' => $request->all()]);
 
         $data = $request->validate([
             'user_identifier' => 'required|string',
@@ -29,23 +23,11 @@ class ReceiveDataController extends Controller
             'payload.*'       => 'array',
         ]);
 
-        // Find client and connect tenant DB
-        try {
-            $client = Client::where('id', $data['user_identifier'])
-                ->orWhere('database_name', $data['user_identifier'])
-                ->firstOrFail();
-        } catch (\Exception $e) {
-            Log::error('Cliente não encontrado', ['identifier' => $data['user_identifier']]);
-            return response()->json(['error' => 'Cliente não encontrado'], 404);
-        }
-
-        try {
-            $this->connectToTenant($client);
-            DB::connection('tenant')->getPdo();
-        } catch (\Exception $e) {
-            Log::error('Falha conexão tenant', ['error' => $e->getMessage()]);
-            return response()->json(['error' => 'Falha na conexão com o tenant'], 500);
-        }
+        // Connect tenant
+        $client = Client::where('id', $data['user_identifier'])
+            ->orWhere('database_name', $data['user_identifier'])
+            ->firstOrFail();
+        $this->connectToTenant($client);
 
         $conn = DB::connection('tenant');
         $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, false);
@@ -54,77 +36,60 @@ class ReceiveDataController extends Controller
         try {
             foreach ($data['payload'] as $rawTable => $rows) {
                 $table = $this->sanitizeTableName($rawTable);
-                if (empty($rows)) {
-                    Log::info("Ignorando tabela vazia: $table");
-                    continue;
-                }
+                if (empty($rows)) continue;
+
                 Log::info('Processando tabela', ['table' => $table, 'rows' => count($rows)]);
 
-                // Remove 'id' before inferring types
-                $cleanRows = array_map(function ($row) {
-                    unset($row['id']);
-                    return $row;
-                }, $rows);
+                $columnTypes = $this->inferColumnTypes($rows);
 
-                $columnTypes = $this->inferColumnTypes($cleanRows);
+                if (Schema::connection('tenant')->hasTable($table)) {
+                    $existingCols = Schema::connection('tenant')->getColumnListing($table);
+                    $newCols = array_keys($columnTypes);
+                    sort($existingCols);
+                    sort($newCols);
 
-                if (! Schema::connection('tenant')->hasTable($table)) {
-                    $this->createTableWithTypes($table, $columnTypes);
+                    if ($existingCols !== $newCols) {
+                        Schema::connection('tenant')->dropIfExists($table);
+                        $this->createTableWithTypes($table, $columnTypes);
+                    }
                 } else {
-                    $this->updateTableSchemaWithTypes($table, $columnTypes);
+                    $this->createTableWithTypes($table, $columnTypes);
                 }
 
                 DB::connection('tenant')->statement("ALTER TABLE `$table` ROW_FORMAT=DYNAMIC");
+                $conn->table($table)->truncate();
 
-                // Upsert rows including 'id'
-                $cols       = Schema::connection('tenant')->getColumnListing($table);
-                $pk         = $this->guessPrimaryKey($cols, $table);
-                $filtered   = $this->filterRows($rows, $cols, $pk);
-                $unique     = $this->detectPrimaryKey($table, $cols);
-                $updateCols = array_diff($cols, array_merge((array) $unique, ['created_at','updated_at','synced_at']));
-
-                foreach (array_chunk($filtered, 500) as $batch) {
-                    DB::connection('tenant')->table($table)
-                        ->upsert($batch, (array) $unique, $updateCols);
+                foreach (array_chunk($rows, 500) as $batch) {
+                    $conn->table($table)->insert($batch);
                 }
+
+                Log::info('Dados gravados', ['table' => $table, 'count' => count($rows)]);
             }
 
             $conn->commit();
             $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
-
-            Log::info('Sincronização concluída', ['client_id' => $client->id]);
-            return response()->json(['message' => 'Dados sincronizados com sucesso']);
-
+            return response()->json(['message' => 'Sincronização completa']);
         } catch (\Throwable $e) {
             $conn->rollBack();
             $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
-
-            Log::error('Erro na transação', [
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
-            ]);
+            Log::error('Erro', ['error' => $e->getMessage()]);
             return response()->json(['error' => $e->getMessage()], 500);
         }
     }
 
-    /** Infer column types from rows */
     protected function inferColumnTypes(array $rows): array
     {
-        $columns = array_keys($rows[0] ?? []);
-        $types   = [];
+        $columns = array_keys($rows[0]);
+        $types = [];
         foreach ($columns as $col) {
-            $maxInt = 0;
-            $maxLen = 0;
+            $maxInt = 0; $maxLen = 0;
             foreach ($rows as $row) {
-                if (! isset($row[$col])) {
-                    continue;
+                $v = $row[$col] ?? null;
+                if (is_numeric($v) && ctype_digit((string)$v)) {
+                    $maxInt = max($maxInt, (int)$v);
                 }
-                $value = $row[$col];
-                if (is_numeric($value) && ctype_digit((string) $value)) {
-                    $maxInt = max($maxInt, (int) $value);
-                }
-                if (is_string($value)) {
-                    $maxLen = max($maxLen, mb_strlen($value));
+                if (is_string($v)) {
+                    $maxLen = max($maxLen, mb_strlen($v));
                 }
             }
             if ($maxInt > 2147483647) {
@@ -138,21 +103,21 @@ class ReceiveDataController extends Controller
         return $types;
     }
 
-    /** Create table with inferred column types */
     protected function createTableWithTypes(string $table, array $types)
     {
         Schema::connection('tenant')->create($table, function (Blueprint $t) use ($types) {
             $t->id();
-            foreach ($types as $column => $type) {
+            foreach ($types as $col => $type) {
                 switch ($type) {
                     case 'bigInteger':
-                        $t->bigInteger($column)->nullable();
+                        $t->bigInteger($col)->nullable();
                         break;
                     case 'text':
-                        $t->text($column)->nullable();
+                        $t->text($col)->nullable();
                         break;
                     default:
-                        $t->string($column, 191)->nullable();
+                        $t->string($col, 191)->nullable();
+                        break;
                 }
             }
             $t->timestamps();
@@ -160,89 +125,81 @@ class ReceiveDataController extends Controller
         });
     }
 
-    /** Update existing table schema by adding new columns */
     protected function updateTableSchemaWithTypes(string $table, array $types)
     {
         $existing = Schema::connection('tenant')->getColumnListing($table);
-        $newCols  = array_diff(array_keys($types), $existing);
-        if (empty($newCols)) {
-            return;
-        }
-        Schema::connection('tenant')->table($table, function (Blueprint $t) use ($types, $newCols) {
-            foreach ($newCols as $column) {
-                switch ($types[$column]) {
+        $new = array_diff(array_keys($types), $existing);
+        if (empty($new)) return;
+
+        Schema::connection('tenant')->table($table, function (Blueprint $t) use ($types, $new) {
+            foreach ($new as $col) {
+                switch ($types[$col]) {
                     case 'bigInteger':
-                        $t->bigInteger($column)->nullable()->after('id');
+                        $t->bigInteger($col)->nullable()->after('id');
                         break;
                     case 'text':
-                        $t->text($column)->nullable()->after('id');
+                        $t->text($col)->nullable()->after('id');
                         break;
                     default:
-                        $t->string($column, 191)->nullable()->after('id');
+                        $t->string($col, 191)->nullable()->after('id');
+                        break;
                 }
             }
         });
     }
 
-    /** Filter rows keeping only existing columns and primary key */
-    protected function filterRows(array $rows, array $columns, ?string $pk): array
+    protected function filterRows(array $rows, array $cols, ?string $pk): array
     {
-        return array_map(function ($row) use ($columns, $pk) {
-            $filtered = [];
-            foreach ($row as $key => $value) {
-                $colKey = ($pk && $key === $pk && in_array('id', $columns)) ? 'id' : $key;
-                if (in_array($colKey, $columns)) {
-                    $filtered[$colKey] = $value;
+        return array_map(function ($row) use ($cols, $pk) {
+            $out = [];
+            foreach ($row as $k => $v) {
+                $key = ($pk && $k === $pk && in_array('id', $cols)) ? 'id' : $k;
+                if (in_array($key, $cols)) {
+                    $out[$key] = $v;
                 }
             }
-            return $filtered;
+            return $out;
         }, $rows);
     }
 
-    /** Detect primary key columns */
-    protected function detectPrimaryKey(string $table, array $columns): array
+    protected function detectPrimaryKey(string $table, array $cols): array
     {
-        if (in_array('id', $columns)) {
+        if (in_array('id', $cols)) {
             return ['id'];
         }
         try {
-            $schemaManager = Schema::connection('tenant')
-                ->getConnection()->getDoctrineConnection()->getSchemaManager();
-            $pk = $schemaManager->listTableDetails($table)->getPrimaryKey();
-            return $pk ? $pk->getColumns() : [array_key_first($columns)];
+            $sm = Schema::connection('tenant')->getConnection()->getDoctrineConnection()->getSchemaManager();
+            $pk = $sm->listTableDetails($table)->getPrimaryKey();
+            if ($pk) {
+                return $pk->getColumns();
+            }
         } catch (\Throwable $e) {
-            return [array_key_first($columns)];
         }
+        return [array_key_first($cols)];
     }
 
-    /** Guess primary key name by convention */
-    protected function guessPrimaryKey(array $columns, string $table): ?string
+    protected function guessPrimaryKey(array $cols, string $table): ?string
     {
-        foreach ($columns as $col) {
-            $lower = Str::lower($col);
-            if ($lower === 'id' || $lower === $table.'_id') {
+        foreach ($cols as $col) {
+            if (Str::lower($col) === 'id' || Str::lower($col) === $table . '_id') {
                 return $col;
             }
         }
         return null;
     }
 
-    /** Sanitize table name to safe characters */
     protected function sanitizeTableName(string $name): string
     {
         return preg_replace('/[^a-zA-Z0-9_]/', '', $name);
     }
 
-    /** Configure tenant DB connection with MySQL fallback to SQLite */
     protected function connectToTenant(Client $client)
     {
-        $database = $client->database_name;
-        // MySQL configuration
         config(['database.connections.tenant' => [
             'driver'    => 'mysql',
-            'host'      => env('DB_HOST', '127.0.0.1'),
-            'port'      => env('DB_PORT', '3306'),
-            'database'  => $database,
+            'host'      => env('DB_HOST','127.0.0.1'),
+            'port'      => env('DB_PORT','3306'),
+            'database'  => $client->database_name,
             'username'  => env('DB_USERNAME'),
             'password'  => env('DB_PASSWORD'),
             'charset'   => 'utf8mb4',
@@ -251,35 +208,11 @@ class ReceiveDataController extends Controller
         ]]);
         DB::purge('tenant');
         DB::reconnect('tenant');
-
-        try {
-            DB::connection('tenant')->getPdo();
-            return;
-        } catch (\Exception $e) {
-            Log::warning('MySQL falhou, tentando SQLite', ['db' => $database, 'error' => $e->getMessage()]);
-        }
-
-        // SQLite fallback
-        $path = database_path("tenants/{$database}.sqlite");
-        if (! file_exists($path)) {
-            throw new \Exception("Arquivo SQLite não encontrado: {$path}");
-        }
-        config(['database.connections.tenant' => [
-            'driver'                  => 'sqlite',
-            'database'                => $path,
-            'prefix'                  => '',
-            'foreign_key_constraints' => true,
-        ]]);
-        DB::purge('tenant');
-        DB::reconnect('tenant');
     }
 
-    /**
-     * Provide BI connection details.
-     */
     public function connectBI(Request $request)
     {
-        Log::info('ReceiveData /connectbi', ['payload' => $request->all(), 'headers' => $request->headers->all()]);
+        Log::info('ReceiveData /connectbi', ['payload' => $request->all()]);
 
         $data = $request->validate([
             'user_identifier' => 'required|string',
@@ -289,16 +222,12 @@ class ReceiveDataController extends Controller
         $client = Client::where('id', $data['user_identifier'])
             ->orWhere('database_name', $data['user_identifier'])
             ->firstOrFail();
-
         $this->connectToTenant($client);
-        $tables = Schema::connection('tenant')->getAllTables();
 
-        $meta = array_map(function ($table) {
-            $name = is_object($table) ? array_values((array) $table)[0] : $table;
-            return [
-                'table'   => $name,
-                'columns' => Schema::connection('tenant')->getColumnListing($name),
-            ];
+        $tables = Schema::connection('tenant')->getAllTables();
+        $meta = array_map(function ($t) {
+            $name = is_object($t) ? array_values((array)$t)[0] : $t;
+            return ['table' => $name, 'columns' => Schema::connection('tenant')->getColumnListing($name)];
         }, $tables);
 
         return response()->json([
