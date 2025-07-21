@@ -26,30 +26,13 @@ class ReceiveDataController extends Controller
             'payload.*'       => 'array',
         ]);
 
-        Log::info('Payload recebido', [
-            'user_identifier' => $data['user_identifier'],
-            'tables'          => array_keys($data['payload']),
-            'total_tables'    => count($data['payload']),
-            'total_rows'      => array_sum(array_map('count', $data['payload'])),
-        ]);
-
         // Find client and connect tenant DB
-        try {
-            $client = Client::where('id', $data['user_identifier'])
-                ->orWhere('database_name', $data['user_identifier'])
-                ->firstOrFail();
-        } catch (\Exception $e) {
-            Log::error('Cliente não encontrado', ['identifier' => $data['user_identifier']]);
-            return response()->json(['error' => 'Cliente não encontrado'], 404);
-        }
+        $client = Client::where('id', $data['user_identifier'])
+            ->orWhere('database_name', $data['user_identifier'])
+            ->firstOrFail();
 
-        try {
-            $this->connectToTenant($client);
-            DB::connection('tenant')->getPdo();
-        } catch (\Exception $e) {
-            Log::error('Falha conexão tenant', ['error' => $e->getMessage()]);
-            return response()->json(['error' => 'Falha na conexão com o tenant'], 500);
-        }
+        $this->connectToTenant($client);
+        DB::connection('tenant')->getPdo();
 
         $conn = DB::connection('tenant');
         $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, false);
@@ -62,10 +45,17 @@ class ReceiveDataController extends Controller
                     Log::info("Ignorando tabela vazia: $table");
                     continue;
                 }
-                Log::info('Processando tabela', ['table' => $table, 'rows' => count($rows)]);
 
-                // Infer column types based on ALL rows
-                $columnTypes = $this->inferColumnTypes($rows);
+                // Remover coluna 'id' dos dados antes de inferir schema
+                $cleanRows = array_map(function($r) {
+                    if (isset($r['id'])) {
+                        unset($r['id']);
+                    }
+                    return $r;
+                }, $rows);
+
+                // Inferir tipos sem 'id'
+                $columnTypes = $this->inferColumnTypes(\$cleanRows);
 
                 if (!Schema::connection('tenant')->hasTable($table)) {
                     $this->createTableWithTypes($table, $columnTypes);
@@ -73,43 +63,28 @@ class ReceiveDataController extends Controller
                     $this->updateTableSchemaWithTypes($table, $columnTypes);
                 }
 
-                // Avoid row-size errors
                 DB::connection('tenant')->statement("ALTER TABLE `$table` ROW_FORMAT=DYNAMIC");
 
-                $cols   = Schema::connection('tenant')->getColumnListing($table);
-                $pk     = $this->guessPrimaryKey($cols, $table);
-                $filtered = $this->filterRows($rows, $cols, $pk);
-                $unique   = $this->detectPrimaryKey($table, $cols);
-                $updateCols = array_diff($cols, array_merge((array) $unique, ['created_at','updated_at','synced_at']));
+                // Filtrar e preparar rows (mantendo id para upsert agora que tabela existe)
+                \$cols = Schema::connection('tenant')->getColumnListing(\$table);
+                \$pk   = \$this->guessPrimaryKey(\$cols, \$table);
+                \$filtered = \$this->filterRows(\$rows, \$cols, \$pk);
+                \$unique   = \$this->detectPrimaryKey(\$table, \$cols);
+                \$updateCols = array_diff(\$cols, array_merge((array)\$unique, ['created_at','updated_at','synced_at']));
 
-                // Resilient upsert in batches
-                foreach (array_chunk($filtered, 500) as $batch) {
-                    try {
-                        DB::connection('tenant')->table($table)->upsert($batch, (array)$unique, $updateCols);
-                        Log::info('Batch upsert com sucesso', ['table' => $table, 'count' => count($batch)]);
-                    } catch (\Exception $e) {
-                        Log::warning('Erro no batch upsert, tentando linha a linha', ['table' => $table, 'error' => $e->getMessage()]);
-                        foreach ($batch as $row) {
-                            try {
-                                DB::connection('tenant')->table($table)->upsert([$row], (array)$unique, $updateCols);
-                            } catch (\Exception $ex) {
-                                Log::error('Linha problemática', ['table' => $table, 'row' => $row, 'error' => $ex->getMessage()]);
-                            }
-                        }
-                    }
+                foreach (array_chunk(\$filtered, 500) as \$batch) {
+                    DB::connection('tenant')->table(\$table)->upsert(\$batch, (array)\$unique, \$updateCols);
                 }
             }
 
-            $conn->commit();
-            $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
-            Log::info('Sincronização concluída', ['client_id' => $client->id]);
-
+            \$conn->commit();
+            \$conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
             return response()->json(['message' => 'Dados sincronizados com sucesso']);
-        } catch (\Throwable $e) {
-            $conn->rollBack();
-            $conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
-            Log::error('Erro na transação', ['error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
-            return response()->json(['error' => $e->getMessage()], 500);
+        } catch (\Throwable \$e) {
+            \$conn->rollBack();
+            \$conn->getPdo()->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
+            Log::error('Erro na transação', ['error' => \$e->getMessage(), 'trace' => \$e->getTraceAsString()]);
+            return response()->json(['error' => \$e->getMessage()], 500);
         }
     }
 
