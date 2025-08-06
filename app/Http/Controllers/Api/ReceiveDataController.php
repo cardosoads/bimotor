@@ -115,24 +115,63 @@ class ReceiveDataController extends Controller
         foreach ($columns as $col) {
             $maxInt = 0;
             $maxLen = 0;
+            $isNumeric = true;
+            $isDate = true;
+            
             foreach ($rows as $row) {
-                if (! isset($row[$col])) {
+                if (! isset($row[$col]) || $row[$col] === null || $row[$col] === '') {
                     continue;
                 }
                 $value = $row[$col];
-                if (is_numeric($value) && ctype_digit((string) $value)) {
-                    $maxInt = max($maxInt, (int) $value);
+                
+                // Check if numeric
+                if ($isNumeric && is_numeric($value)) {
+                    if (ctype_digit((string) $value)) {
+                        $maxInt = max($maxInt, (int) $value);
+                    } else {
+                        $isNumeric = false;
+                    }
+                } else {
+                    $isNumeric = false;
                 }
+                
+                // Check if date
+                if ($isDate && !strtotime($value)) {
+                    $isDate = false;
+                }
+                
                 if (is_string($value)) {
                     $maxLen = max($maxLen, mb_strlen($value));
                 }
             }
-            if ($maxInt > 2147483647) {
-                $types[$col] = 'bigInteger';
-            } elseif ($maxLen > 191) {
+            
+            // Determine optimal type
+            if ($isNumeric && $maxInt > 0) {
+                if ($maxInt > 2147483647) {
+                    $types[$col] = 'bigInteger';
+                } elseif ($maxInt > 32767) {
+                    $types[$col] = 'integer';
+                } elseif ($maxInt > 127) {
+                    $types[$col] = 'smallInteger';
+                } else {
+                    $types[$col] = 'tinyInteger';
+                }
+            } elseif ($isDate && $maxLen > 0) {
+                $types[$col] = 'timestamp';
+            } elseif ($maxLen > 65535) {
+                $types[$col] = 'longText';
+            } elseif ($maxLen > 16777215) {
+                $types[$col] = 'mediumText';
+            } elseif ($maxLen > 255) {
                 $types[$col] = 'text';
+            } elseif ($maxLen > 100) {
+                $types[$col] = 'string100';
+            } elseif ($maxLen > 50) {
+                $types[$col] = 'string50';
+            } elseif ($maxLen > 20) {
+                $types[$col] = 'string20';
             } else {
-                $types[$col] = 'string';
+                $types[$col] = 'string10';
             }
         }
         return $types;
@@ -148,11 +187,41 @@ class ReceiveDataController extends Controller
                     case 'bigInteger':
                         $t->bigInteger($column)->nullable();
                         break;
+                    case 'integer':
+                        $t->integer($column)->nullable();
+                        break;
+                    case 'smallInteger':
+                        $t->smallInteger($column)->nullable();
+                        break;
+                    case 'tinyInteger':
+                        $t->tinyInteger($column)->nullable();
+                        break;
+                    case 'timestamp':
+                        $t->timestamp($column)->nullable();
+                        break;
+                    case 'longText':
+                        $t->longText($column)->nullable();
+                        break;
+                    case 'mediumText':
+                        $t->mediumText($column)->nullable();
+                        break;
                     case 'text':
                         $t->text($column)->nullable();
                         break;
+                    case 'string100':
+                        $t->string($column, 100)->nullable();
+                        break;
+                    case 'string50':
+                        $t->string($column, 50)->nullable();
+                        break;
+                    case 'string20':
+                        $t->string($column, 20)->nullable();
+                        break;
+                    case 'string10':
+                        $t->string($column, 10)->nullable();
+                        break;
                     default:
-                        $t->string($column, 191)->nullable();
+                        $t->string($column, 50)->nullable();
                 }
             }
             $t->timestamps();
@@ -174,11 +243,41 @@ class ReceiveDataController extends Controller
                     case 'bigInteger':
                         $t->bigInteger($column)->nullable()->after('id');
                         break;
+                    case 'integer':
+                        $t->integer($column)->nullable()->after('id');
+                        break;
+                    case 'smallInteger':
+                        $t->smallInteger($column)->nullable()->after('id');
+                        break;
+                    case 'tinyInteger':
+                        $t->tinyInteger($column)->nullable()->after('id');
+                        break;
+                    case 'timestamp':
+                        $t->timestamp($column)->nullable()->after('id');
+                        break;
+                    case 'longText':
+                        $t->longText($column)->nullable()->after('id');
+                        break;
+                    case 'mediumText':
+                        $t->mediumText($column)->nullable()->after('id');
+                        break;
                     case 'text':
                         $t->text($column)->nullable()->after('id');
                         break;
+                    case 'string100':
+                        $t->string($column, 100)->nullable()->after('id');
+                        break;
+                    case 'string50':
+                        $t->string($column, 50)->nullable()->after('id');
+                        break;
+                    case 'string20':
+                        $t->string($column, 20)->nullable()->after('id');
+                        break;
+                    case 'string10':
+                        $t->string($column, 10)->nullable()->after('id');
+                        break;
                     default:
-                        $t->string($column, 191)->nullable()->after('id');
+                        $t->string($column, 50)->nullable()->after('id');
                 }
             }
         });
