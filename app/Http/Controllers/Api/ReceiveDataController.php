@@ -154,7 +154,7 @@ class ReceiveDataController extends Controller
                 }
             }
             
-            // Determine optimal type
+            // Determine optimal type - be more conservative to avoid truncation
             if ($isNumeric && $maxInt > 0) {
                 if ($maxInt > 2147483647) {
                     $types[$col] = 'bigInteger';
@@ -171,19 +171,19 @@ class ReceiveDataController extends Controller
                 $types[$col] = 'longText';
             } elseif ($maxLen > 16777215) {
                 $types[$col] = 'mediumText';
-            } elseif ($maxLen > 255 || $hasLongValues) {
+            } elseif ($maxLen > 50 || $hasLongValues || $useTextForManyColumns) {
+                // Be very conservative: use TEXT for values > 50 chars or when many columns
                 $types[$col] = 'text';
-            } elseif ($useTextForManyColumns && $maxLen > 50) {
-                // Para tabelas com muitas colunas, use TEXT para valores maiores que 50 chars
-                $types[$col] = 'text';
-            } elseif ($maxLen > 100) {
-                $types[$col] = $useTextForManyColumns ? 'text' : 'string100';
-            } elseif ($maxLen > 50) {
-                $types[$col] = $useTextForManyColumns ? 'text' : 'string50';
+            } elseif ($maxLen > 30) {
+                $types[$col] = 'string100';
             } elseif ($maxLen > 20) {
-                $types[$col] = 'string20';
-            } else {
-                $types[$col] = 'string10';
+                 $types[$col] = 'string50';
+             } elseif ($maxLen > 15) {
+                 $types[$col] = 'string30';
+             } elseif ($maxLen > 10) {
+                 $types[$col] = 'string20';
+             } else {
+                 $types[$col] = 'string20';
             }
         }
         
@@ -192,7 +192,7 @@ class ReceiveDataController extends Controller
         if ($estimatedRowSize > 50000) { // Margem de segurança antes do limite de 65535
             Log::warning("Tamanho estimado da linha muito grande ($estimatedRowSize bytes), convertendo strings para TEXT");
             foreach ($types as $col => $type) {
-                if (in_array($type, ['string100', 'string50', 'string20', 'string10'])) {
+                if (in_array($type, ['string191', 'string100', 'string50', 'string30', 'string20'])) {
                     $types[$col] = 'text';
                 }
             }
@@ -207,40 +207,40 @@ class ReceiveDataController extends Controller
         $size = 0;
         foreach ($types as $type) {
             switch ($type) {
-                case 'bigInteger':
-                    $size += 8;
-                    break;
-                case 'integer':
-                    $size += 4;
+                case 'tinyInteger':
+                    $size += 1;
                     break;
                 case 'smallInteger':
                     $size += 2;
                     break;
-                case 'tinyInteger':
-                    $size += 1;
+                case 'integer':
+                    $size += 4;
+                    break;
+                case 'bigInteger':
+                    $size += 8;
                     break;
                 case 'timestamp':
                     $size += 4;
                     break;
-                case 'string100':
-                    $size += 300; // UTF8MB4 = 3-4 bytes per char
+                case 'string20':
+                    $size += 20;
+                    break;
+                case 'string30':
+                    $size += 30;
                     break;
                 case 'string50':
-                    $size += 150;
+                    $size += 50;
                     break;
-                case 'string20':
-                    $size += 60;
-                    break;
-                case 'string10':
-                    $size += 30;
+                case 'string100':
+                    $size += 100;
                     break;
                 case 'text':
                 case 'mediumText':
                 case 'longText':
-                    $size += 10; // TEXT types store pointer, not full content
+                    $size += 10; // TEXT uses pointer
                     break;
                 default:
-                    $size += 150; // Default string estimate
+                    $size += 50; // default
             }
         }
         return $size;
@@ -279,17 +279,18 @@ class ReceiveDataController extends Controller
                     case 'text':
                         $t->text($column)->nullable();
                         break;
+
                     case 'string100':
                         $t->string($column, 100)->nullable();
                         break;
                     case 'string50':
                         $t->string($column, 50)->nullable();
                         break;
+                    case 'string30':
+                        $t->string($column, 30)->nullable();
+                        break;
                     case 'string20':
                         $t->string($column, 20)->nullable();
-                        break;
-                    case 'string10':
-                        $t->string($column, 10)->nullable();
                         break;
                     default:
                         $t->text($column)->nullable(); // Mudança: usar TEXT como padrão ao invés de string(50)
@@ -349,17 +350,18 @@ class ReceiveDataController extends Controller
                     case 'text':
                         $t->text($column)->nullable()->after('id');
                         break;
+
                     case 'string100':
                         $t->string($column, 100)->nullable()->after('id');
                         break;
                     case 'string50':
                         $t->string($column, 50)->nullable()->after('id');
                         break;
+                    case 'string30':
+                        $t->string($column, 30)->nullable()->after('id');
+                        break;
                     case 'string20':
                         $t->string($column, 20)->nullable()->after('id');
-                        break;
-                    case 'string10':
-                        $t->string($column, 10)->nullable()->after('id');
                         break;
                     default:
                         $t->text($column)->nullable()->after('id'); // Mudança: usar TEXT como padrão
