@@ -74,8 +74,6 @@ class ReceiveDataController extends Controller
                     $this->updateTableSchemaWithTypes($table, $columnTypes);
                 }
 
-                DB::connection('tenant')->statement("ALTER TABLE `$table` ROW_FORMAT=DYNAMIC");
-
                 // Upsert rows including 'id'
                 $cols       = Schema::connection('tenant')->getColumnListing($table);
                 $pk         = $this->guessPrimaryKey($cols, $table);
@@ -112,11 +110,17 @@ class ReceiveDataController extends Controller
     {
         $columns = array_keys($rows[0] ?? []);
         $types   = [];
+        $totalColumns = count($columns);
+        
+        // Se há muitas colunas, seja mais conservador com VARCHAR para evitar limite de linha
+        $useTextForManyColumns = $totalColumns > 50;
+        
         foreach ($columns as $col) {
             $maxInt = 0;
             $maxLen = 0;
             $isNumeric = true;
             $isDate = true;
+            $hasLongValues = false;
             
             foreach ($rows as $row) {
                 if (! isset($row[$col]) || $row[$col] === null || $row[$col] === '') {
@@ -141,7 +145,11 @@ class ReceiveDataController extends Controller
                 }
                 
                 if (is_string($value)) {
-                    $maxLen = max($maxLen, mb_strlen($value));
+                    $len = mb_strlen($value);
+                    $maxLen = max($maxLen, $len);
+                    if ($len > 100) {
+                        $hasLongValues = true;
+                    }
                 }
             }
             
@@ -162,24 +170,86 @@ class ReceiveDataController extends Controller
                 $types[$col] = 'longText';
             } elseif ($maxLen > 16777215) {
                 $types[$col] = 'mediumText';
-            } elseif ($maxLen > 255) {
+            } elseif ($maxLen > 255 || $hasLongValues) {
+                $types[$col] = 'text';
+            } elseif ($useTextForManyColumns && $maxLen > 50) {
+                // Para tabelas com muitas colunas, use TEXT para valores maiores que 50 chars
                 $types[$col] = 'text';
             } elseif ($maxLen > 100) {
-                $types[$col] = 'string100';
+                $types[$col] = $useTextForManyColumns ? 'text' : 'string100';
             } elseif ($maxLen > 50) {
-                $types[$col] = 'string50';
+                $types[$col] = $useTextForManyColumns ? 'text' : 'string50';
             } elseif ($maxLen > 20) {
                 $types[$col] = 'string20';
             } else {
                 $types[$col] = 'string10';
             }
         }
+        
+        // Verificação adicional: se estimativa de tamanho de linha for muito grande, converta strings para text
+        $estimatedRowSize = $this->estimateRowSize($types);
+        if ($estimatedRowSize > 50000) { // Margem de segurança antes do limite de 65535
+            Log::warning("Tamanho estimado da linha muito grande ($estimatedRowSize bytes), convertendo strings para TEXT");
+            foreach ($types as $col => $type) {
+                if (in_array($type, ['string100', 'string50', 'string20', 'string10'])) {
+                    $types[$col] = 'text';
+                }
+            }
+        }
+        
         return $types;
+    }
+    
+    /** Estimate row size in bytes */
+    protected function estimateRowSize(array $types): int
+    {
+        $size = 0;
+        foreach ($types as $type) {
+            switch ($type) {
+                case 'bigInteger':
+                    $size += 8;
+                    break;
+                case 'integer':
+                    $size += 4;
+                    break;
+                case 'smallInteger':
+                    $size += 2;
+                    break;
+                case 'tinyInteger':
+                    $size += 1;
+                    break;
+                case 'timestamp':
+                    $size += 4;
+                    break;
+                case 'string100':
+                    $size += 300; // UTF8MB4 = 3-4 bytes per char
+                    break;
+                case 'string50':
+                    $size += 150;
+                    break;
+                case 'string20':
+                    $size += 60;
+                    break;
+                case 'string10':
+                    $size += 30;
+                    break;
+                case 'text':
+                case 'mediumText':
+                case 'longText':
+                    $size += 10; // TEXT types store pointer, not full content
+                    break;
+                default:
+                    $size += 150; // Default string estimate
+            }
+        }
+        return $size;
     }
 
     /** Create table with inferred column types */
     protected function createTableWithTypes(string $table, array $types)
     {
+        Log::info("Criando tabela $table com " . count($types) . " colunas", ['types' => $types]);
+        
         Schema::connection('tenant')->create($table, function (Blueprint $t) use ($types) {
             $t->id();
             foreach ($types as $column => $type) {
@@ -221,12 +291,23 @@ class ReceiveDataController extends Controller
                         $t->string($column, 10)->nullable();
                         break;
                     default:
-                        $t->string($column, 50)->nullable();
+                        $t->text($column)->nullable(); // Mudança: usar TEXT como padrão ao invés de string(50)
                 }
             }
             $t->timestamps();
             $t->timestamp('synced_at')->nullable();
+            
+            // Configurar engine e row format para suportar linhas grandes
+            $t->engine = 'InnoDB';
         });
+        
+        // Configurar ROW_FORMAT=DYNAMIC após criação da tabela
+        try {
+            DB::connection('tenant')->statement("ALTER TABLE `$table` ROW_FORMAT=DYNAMIC");
+            Log::info("ROW_FORMAT=DYNAMIC configurado para tabela $table");
+        } catch (\Exception $e) {
+            Log::warning("Falha ao configurar ROW_FORMAT=DYNAMIC para $table: " . $e->getMessage());
+        }
     }
 
     /** Update existing table schema by adding new columns */
@@ -237,6 +318,9 @@ class ReceiveDataController extends Controller
         if (empty($newCols)) {
             return;
         }
+        
+        Log::info("Adicionando " . count($newCols) . " novas colunas à tabela $table", ['columns' => $newCols]);
+        
         Schema::connection('tenant')->table($table, function (Blueprint $t) use ($types, $newCols) {
             foreach ($newCols as $column) {
                 switch ($types[$column]) {
@@ -277,7 +361,7 @@ class ReceiveDataController extends Controller
                         $t->string($column, 10)->nullable()->after('id');
                         break;
                     default:
-                        $t->string($column, 50)->nullable()->after('id');
+                        $t->text($column)->nullable()->after('id'); // Mudança: usar TEXT como padrão
                 }
             }
         });
