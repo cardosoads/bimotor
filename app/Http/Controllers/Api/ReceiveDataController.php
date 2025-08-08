@@ -78,10 +78,11 @@ class ReceiveDataController extends Controller
                 $cols       = Schema::connection('tenant')->getColumnListing($table);
                 $pk         = $this->guessPrimaryKey($cols, $table);
                 $filtered   = $this->filterRows($rows, $cols, $pk);
+                $processed  = $this->processDateTimeValues($filtered, $columnTypes);
                 $unique     = $this->detectPrimaryKey($table, $cols);
                 $updateCols = array_diff($cols, array_merge((array) $unique, ['created_at','updated_at','synced_at']));
 
-                foreach (array_chunk($filtered, 500) as $batch) {
+                foreach (array_chunk($processed, 500) as $batch) {
                     DB::connection('tenant')->table($table)
                         ->upsert($batch, (array) $unique, $updateCols);
                 }
@@ -380,6 +381,48 @@ class ReceiveDataController extends Controller
             }
             return $filtered;
         }, $rows);
+    }
+
+    /** Process datetime values to convert ISO 8601 to MySQL format */
+    protected function processDateTimeValues(array $rows, array $columnTypes): array
+    {
+        return array_map(function ($row) use ($columnTypes) {
+            $processed = [];
+            foreach ($row as $key => $value) {
+                // Se a coluna é do tipo timestamp e o valor parece ser ISO 8601
+                if (isset($columnTypes[$key]) && $columnTypes[$key] === 'timestamp' && is_string($value)) {
+                    $processed[$key] = $this->convertIsoToMysqlDateTime($value);
+                } else {
+                    $processed[$key] = $value;
+                }
+            }
+            return $processed;
+        }, $rows);
+    }
+
+    /** Convert ISO 8601 datetime to MySQL format */
+    protected function convertIsoToMysqlDateTime(string $isoDateTime): ?string
+    {
+        try {
+            // Tenta converter ISO 8601 para MySQL format
+            if (preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z?$/', $isoDateTime)) {
+                $date = new \DateTime($isoDateTime);
+                return $date->format('Y-m-d H:i:s');
+            }
+            
+            // Se já está no formato MySQL, retorna como está
+            if (preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', $isoDateTime)) {
+                return $isoDateTime;
+            }
+            
+            // Tenta fazer parse genérico
+            $date = new \DateTime($isoDateTime);
+            return $date->format('Y-m-d H:i:s');
+            
+        } catch (\Exception $e) {
+            Log::warning("Falha ao converter data: $isoDateTime", ['error' => $e->getMessage()]);
+            return null;
+        }
     }
 
     /** Detect primary key columns */
