@@ -140,9 +140,14 @@ class ReceiveDataController extends Controller
                     $isNumeric = false;
                 }
                 
-                // Check if date
-                if ($isDate && !strtotime($value)) {
-                    $isDate = false;
+                // Check if date - melhor detecção para ISO 8601
+                if ($isDate) {
+                    // Verifica se é formato ISO 8601 (2025-02-11T03:00:00.000Z)
+                    if (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z?$/', $value) && 
+                        !preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', $value) && 
+                        !strtotime($value)) {
+                        $isDate = false;
+                    }
                 }
                 
                 if (is_string($value)) {
@@ -388,12 +393,20 @@ class ReceiveDataController extends Controller
     /** Process datetime values to convert ISO 8601 to MySQL format */
     protected function processDateTimeValues(array $rows, array $columnTypes): array
     {
+        Log::info('Processando valores de data/hora', ['columnTypes' => $columnTypes]);
+        
         return array_map(function ($row) use ($columnTypes) {
             $processed = [];
             foreach ($row as $key => $value) {
                 // Se a coluna é do tipo timestamp e o valor parece ser ISO 8601
                 if (isset($columnTypes[$key]) && $columnTypes[$key] === 'timestamp' && is_string($value)) {
-                    $processed[$key] = $this->convertIsoToMysqlDateTime($value);
+                    $originalValue = $value;
+                    $convertedValue = $this->convertIsoToMysqlDateTime($value);
+                    Log::info("Convertendo data para coluna '$key'", [
+                        'original' => $originalValue,
+                        'converted' => $convertedValue
+                    ]);
+                    $processed[$key] = $convertedValue;
                 } else {
                     $processed[$key] = $value;
                 }
