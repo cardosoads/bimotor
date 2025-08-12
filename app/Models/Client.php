@@ -63,14 +63,14 @@ class Client extends Model
         });
     }
 
-    public function connectToDatabase(): void
+    public function connectToDatabase(string $connectionName = 'tenant'): void
     {
         $driver = config('database.default');
         $dbName = $this->database_name;
 
         if ($driver === 'mysql') {
             config([
-                'database.connections.tenant' => array_merge(
+                "database.connections.{$connectionName}" => array_merge(
                     config('database.connections.mysql'),
                     ['database' => $dbName]
                 )
@@ -79,15 +79,15 @@ class Client extends Model
 
         if ($driver === 'sqlite') {
             config([
-                'database.connections.tenant' => array_merge(
+                "database.connections.{$connectionName}" => array_merge(
                     config('database.connections.sqlite'),
                     ['database' => database_path("tenants/{$dbName}.sqlite")]
                 )
             ]);
         }
 
-        DB::purge('tenant');
-        DB::reconnect('tenant');
+        DB::purge($connectionName);
+        DB::reconnect($connectionName);
     }
 
 }

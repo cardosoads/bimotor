@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\Api\LoginController;
 use App\Http\Controllers\Api\ReceiveDataController;
+use App\Http\Controllers\Api\CloneController;
 use App\Models\User;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Request;
@@ -24,6 +25,9 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::post('/verify-record', [ReceiveDataController::class, 'verifyRecord']);
     Route::get('/verify-table/{table}', [ReceiveDataController::class, 'verifyTable']);
+    
+    // clonagem de dados entre clientes
+    Route::post('/clone', [CloneController::class, 'clone']);
 });
 
 Route::middleware('auth:sanctum')->group(function () {

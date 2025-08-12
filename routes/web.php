@@ -26,6 +26,11 @@ Route::middleware(['auth', 'verified'])->group(function () {
     Route::get('/clientes/{client}/edit', [ClientController::class, 'edit'])->name('clientes.edit');
     Route::put('/clientes/{client}', [ClientController::class, 'update'])->name('clientes.update');
     Route::delete('/clientes/{client}', [ClientController::class, 'destroy'])->name('clientes.destroy');
+    
+    // Página de clonagem de dados
+    Route::get('/clone', function () {
+        return Inertia::render('Clone');
+    })->name('clone.index');
 });
 
 // Rotas adicionais
