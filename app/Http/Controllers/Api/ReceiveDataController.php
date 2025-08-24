@@ -392,7 +392,7 @@ class ReceiveDataController extends Controller
         // Segunda passagem: inferir tipos baseado nas amostras
         foreach ($columns as $col) {
             if (empty($samples[$col])) {
-                $types[$col] = 'string20';
+                $types[$col] = 'longText'; // Usar longText para capacidade máxima
                 continue;
             }
             
@@ -406,16 +406,9 @@ class ReceiveDataController extends Controller
             ]);
         }
         
-        // Verificação adicional: se estimativa de tamanho de linha for muito grande, converta strings para text
+        // Verificação adicional: log do tamanho estimado da linha
         $estimatedRowSize = $this->estimateRowSize($types);
-        if ($estimatedRowSize > 50000) { // Margem de segurança antes do limite de 65535
-            Log::warning("Tamanho estimado da linha muito grande ($estimatedRowSize bytes), convertendo strings para TEXT");
-            foreach ($types as $col => $type) {
-                if (in_array($type, ['string100', 'string50', 'string30', 'string20'])) {
-                    $types[$col] = 'text';
-                }
-            }
-        }
+        Log::info("Tamanho estimado da linha: $estimatedRowSize bytes (usando LONGTEXT para máxima capacidade)");
         
         return $types;
     }
@@ -479,8 +472,8 @@ class ReceiveDataController extends Controller
         
         // Aplicar regras de decisão
         if ($confidence < 0.7 && $bestType !== 'string' && $bestType !== 'text') {
-            // Se a confiança é baixa, usar string como fallback
-            $bestType = ($maxLen > 255 || $hasLongValues || $useTextForManyColumns) ? 'text' : 'string';
+            // Se a confiança é baixa, usar longText como fallback para máxima capacidade
+            $bestType = 'text';
         }
         
         // Retornar tipo específico baseado na análise
@@ -504,26 +497,10 @@ class ReceiveDataController extends Controller
             case 'json':
                 return 'text'; // Armazenar JSON como TEXT
             case 'text':
-                if ($maxLen > 65535) {
-                    return 'longText';
-                } elseif ($maxLen > 16777215) {
-                    return 'mediumText';
-                } else {
-                    return 'text';
-                }
             case 'string':
             default:
-                if ($maxLen > 255 || $hasLongValues || $useTextForManyColumns) {
-                    return 'text';
-                } elseif ($maxLen > 30) {
-                    return 'string100';
-                } elseif ($maxLen > 20) {
-                    return 'string50';
-                } elseif ($maxLen > 15) {
-                    return 'string30';
-                } else {
-                    return 'string20';
-                }
+                // Para MySQL em produção, usar sempre LONGTEXT para máxima capacidade
+                return 'longText';
         }
     }
     
@@ -603,18 +580,7 @@ class ReceiveDataController extends Controller
                 case 'timestamp':
                     $size += 4;
                     break;
-                case 'string20':
-                    $size += 20;
-                    break;
-                case 'string30':
-                    $size += 30;
-                    break;
-                case 'string50':
-                    $size += 50;
-                    break;
-                case 'string100':
-                    $size += 100;
-                    break;
+                // Tipos string limitados removidos
                 case 'text':
                 case 'mediumText':
                 case 'longText':
@@ -661,20 +627,9 @@ class ReceiveDataController extends Controller
                         $t->text($column)->nullable();
                         break;
 
-                    case 'string100':
-                        $t->string($column, 100)->nullable();
-                        break;
-                    case 'string50':
-                        $t->string($column, 50)->nullable();
-                        break;
-                    case 'string30':
-                        $t->string($column, 30)->nullable();
-                        break;
-                    case 'string20':
-                        $t->string($column, 20)->nullable();
-                        break;
+                    // Tipos string limitados removidos - usando longText para capacidade máxima
                     default:
-                        $t->text($column)->nullable(); // Mudança: usar TEXT como padrão ao invés de string(50)
+                        $t->longText($column)->nullable(); // Usar LONGTEXT para capacidade máxima
                 }
             }
             $t->timestamps();
@@ -732,20 +687,9 @@ class ReceiveDataController extends Controller
                         $t->text($column)->nullable()->after('id');
                         break;
 
-                    case 'string100':
-                        $t->string($column, 100)->nullable()->after('id');
-                        break;
-                    case 'string50':
-                        $t->string($column, 50)->nullable()->after('id');
-                        break;
-                    case 'string30':
-                        $t->string($column, 30)->nullable()->after('id');
-                        break;
-                    case 'string20':
-                        $t->string($column, 20)->nullable()->after('id');
-                        break;
+                    // Tipos string limitados removidos - usando longText para capacidade máxima
                     default:
-                        $t->text($column)->nullable()->after('id'); // Mudança: usar TEXT como padrão
+                        $t->longText($column)->nullable()->after('id'); // Usar LONGTEXT para capacidade máxima
                 }
             }
         });
