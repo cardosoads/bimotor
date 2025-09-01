@@ -213,10 +213,11 @@ class ReceiveDataController extends Controller
                 }
                 $value = $row[$col];
                 
-                // Check if numeric
+                // Check if numeric - simplified to avoid overflow issues
                 if ($isNumeric && is_numeric($value)) {
-                    if (ctype_digit((string) $value)) {
-                        $maxInt = max($maxInt, (int) $value);
+                    if (ctype_digit((string) $value) || (is_string($value) && preg_match('/^-?\d+$/', $value))) {
+                        // Don't track maxInt to avoid PHP integer overflow - just mark as numeric
+                        $maxInt = 1; // Set to 1 to indicate we found numeric values
                     } else {
                         $isNumeric = false;
                     }
@@ -245,15 +246,8 @@ class ReceiveDataController extends Controller
             
             // Determine optimal type - use maximum sizes to avoid truncation
             if ($isNumeric && $maxInt > 0) {
-                if ($maxInt > 2147483647) {
-                    $types[$col] = 'bigInteger';
-                } elseif ($maxInt > 32767) {
-                    $types[$col] = 'integer';
-                } elseif ($maxInt > 127) {
-                    $types[$col] = 'smallInteger';
-                } else {
-                    $types[$col] = 'tinyInteger';
-                }
+                // Always use bigInteger for numeric values to avoid range errors
+                $types[$col] = 'bigInteger';
             } elseif ($isDate && $maxLen > 0) {
                 $types[$col] = 'timestamp';
             } elseif ($maxLen > 65535) {
