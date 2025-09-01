@@ -18,16 +18,47 @@ class ReceiveDataController extends Controller
      */
     public function store(Request $request)
     {
-        Log::info('Requisição /receive', [
-            'payload' => $request->all(),
-            'headers' => $request->headers->all(),
+        // Debug completo do request
+        $rawContent = $request->getContent();
+        Log::info('Requisição /receive - DEBUG', [
+            'all' => $request->all(),
+            'input' => $request->input(),
+            'raw_content' => $rawContent,
+            'method' => $request->method(),
+            'content_type' => $request->header('Content-Type'),
         ]);
 
-        $data = $request->validate([
+        // Parse manual do JSON se necessário
+        $requestData = $request->all();
+        if (empty($requestData) && !empty($rawContent)) {
+            Log::info('Tentando parsear JSON', ['raw_content_length' => strlen($rawContent), 'first_100_chars' => substr($rawContent, 0, 100)]);
+            try {
+                $requestData = json_decode($rawContent, true);
+                $jsonError = json_last_error();
+                Log::info('JSON parseado manualmente', [
+                    'parsed_data' => $requestData, 
+                    'json_error' => $jsonError,
+                    'json_error_msg' => json_last_error_msg()
+                ]);
+            } catch (\Exception $e) {
+                Log::error('Erro ao parsear JSON', ['error' => $e->getMessage(), 'content' => $rawContent]);
+                return response()->json(['error' => 'JSON inválido'], 400);
+            }
+        }
+
+        // Validação dos dados
+        $validator = \Illuminate\Support\Facades\Validator::make($requestData, [
             'user_identifier' => 'required|string',
             'payload'         => 'required|array',
             'payload.*'       => 'array',
         ]);
+
+        if ($validator->fails()) {
+            Log::error('Validação falhou', ['errors' => $validator->errors(), 'data' => $requestData]);
+            return response()->json(['message' => 'Dados inválidos', 'errors' => $validator->errors()], 422);
+        }
+
+        $data = $validator->validated();
 
         // Find client and connect tenant DB
         try {
@@ -52,8 +83,20 @@ class ReceiveDataController extends Controller
         $conn->beginTransaction();
 
         try {
-            foreach ($data['payload'] as $rawTable => $rows) {
-                $table = $this->sanitizeTableName($rawTable);
+            // O payload agora vem no formato {tableName: {data: [...], columns: [...]}}
+            
+            foreach ($data['payload'] as $tableName => $tableData) {
+                $table = $this->sanitizeTableName($tableName);
+                
+                // Suporte para dois formatos: {data: [...], columns: [...]} ou [...] diretamente
+                if (is_array($tableData) && isset($tableData['data'])) {
+                    // Formato novo: {data: [...], columns: [...]}
+                    $rows = $tableData['data'] ?? [];
+                } else {
+                    // Formato antigo: [...] diretamente
+                    $rows = is_array($tableData) ? $tableData : [];
+                }
+                
                 if (empty($rows)) {
                     Log::info("Ignorando tabela vazia: $table");
                     continue;
@@ -62,7 +105,9 @@ class ReceiveDataController extends Controller
 
                 // Remove 'id' before inferring types
                 $cleanRows = array_map(function ($row) {
-                    unset($row['id']);
+                    if (is_array($row) && isset($row['id'])) {
+                        unset($row['id']);
+                    }
                     return $row;
                 }, $rows);
 
@@ -82,10 +127,49 @@ class ReceiveDataController extends Controller
                 $unique     = $this->detectPrimaryKey($table, $cols);
                 $updateCols = array_diff($cols, array_merge((array) $unique, ['created_at','updated_at','synced_at']));
 
-                foreach (array_chunk($processed, 500) as $batch) {
-                    DB::connection('tenant')->table($table)
+                Log::info('Iniciando upsert', [
+                    'table' => $table,
+                    'total_rows' => count($processed),
+                    'unique_keys' => $unique,
+                    'update_columns' => $updateCols,
+                    'sample_data' => array_slice($processed, 0, 2)
+                ]);
+
+                $totalInserted = 0;
+                foreach (array_chunk($processed, 500) as $batchIndex => $batch) {
+                    Log::info("Processando lote {$batchIndex}", [
+                        'batch_size' => count($batch),
+                        'first_row' => $batch[0] ?? null
+                    ]);
+                    
+                    $result = DB::connection('tenant')->table($table)
                         ->upsert($batch, (array) $unique, $updateCols);
+                    
+                    $totalInserted += count($batch);
+                    Log::info("Lote {$batchIndex} processado", [
+                        'rows_in_batch' => count($batch),
+                        'upsert_result' => $result
+                    ]);
                 }
+                
+                Log::info('Upsert concluído', [
+                    'table' => $table,
+                    'total_processed' => $totalInserted
+                ]);
+                
+                // Verificar se os dados foram realmente salvos
+                $recordCount = DB::connection('tenant')->table($table)->count();
+                Log::info('Verificação pós-upsert', [
+                    'table' => $table,
+                    'records_in_table' => $recordCount
+                ]);
+                
+                // Mostrar alguns registros salvos
+                $sampleRecords = DB::connection('tenant')->table($table)->limit(3)->get();
+                Log::info('Amostra de registros salvos', [
+                    'table' => $table,
+                    'sample_records' => $sampleRecords->toArray()
+                ]);
             }
 
             $conn->commit();
@@ -159,7 +243,7 @@ class ReceiveDataController extends Controller
                 }
             }
             
-            // Determine optimal type - be more conservative to avoid truncation
+            // Determine optimal type - use maximum sizes to avoid truncation
             if ($isNumeric && $maxInt > 0) {
                 if ($maxInt > 2147483647) {
                     $types[$col] = 'bigInteger';
@@ -176,19 +260,12 @@ class ReceiveDataController extends Controller
                 $types[$col] = 'longText';
             } elseif ($maxLen > 16777215) {
                 $types[$col] = 'mediumText';
-            } elseif ($maxLen > 50 || $hasLongValues || $useTextForManyColumns) {
-                // Be very conservative: use TEXT for values > 50 chars or when many columns
+            } elseif ($maxLen > 255 || $hasLongValues || $useTextForManyColumns) {
+                // Use TEXT for values > 255 chars or when many columns
                 $types[$col] = 'text';
-            } elseif ($maxLen > 30) {
-                $types[$col] = 'string100';
-            } elseif ($maxLen > 20) {
-                 $types[$col] = 'string50';
-             } elseif ($maxLen > 15) {
-                 $types[$col] = 'string30';
-             } elseif ($maxLen > 10) {
-                 $types[$col] = 'string20';
-             } else {
-                 $types[$col] = 'string20';
+            } else {
+                // Always use maximum string size (255) to avoid truncation
+                $types[$col] = 'string255';
             }
         }
         
@@ -197,7 +274,7 @@ class ReceiveDataController extends Controller
         if ($estimatedRowSize > 50000) { // Margem de segurança antes do limite de 65535
             Log::warning("Tamanho estimado da linha muito grande ($estimatedRowSize bytes), convertendo strings para TEXT");
             foreach ($types as $col => $type) {
-                if (in_array($type, ['string191', 'string100', 'string50', 'string30', 'string20'])) {
+                if (in_array($type, ['string255'])) {
                     $types[$col] = 'text';
                 }
             }
@@ -227,17 +304,8 @@ class ReceiveDataController extends Controller
                 case 'timestamp':
                     $size += 4;
                     break;
-                case 'string20':
-                    $size += 20;
-                    break;
-                case 'string30':
-                    $size += 30;
-                    break;
-                case 'string50':
-                    $size += 50;
-                    break;
-                case 'string100':
-                    $size += 100;
+                case 'string255':
+                    $size += 255;
                     break;
                 case 'text':
                 case 'mediumText':
@@ -259,6 +327,11 @@ class ReceiveDataController extends Controller
         Schema::connection('tenant')->create($table, function (Blueprint $t) use ($types) {
             $t->id();
             foreach ($types as $column => $type) {
+                // Pular created_at e updated_at pois serão criados por timestamps()
+                if (in_array($column, ['created_at', 'updated_at'])) {
+                    continue;
+                }
+                
                 switch ($type) {
                     case 'bigInteger':
                         $t->bigInteger($column)->nullable();
@@ -285,17 +358,8 @@ class ReceiveDataController extends Controller
                         $t->text($column)->nullable();
                         break;
 
-                    case 'string100':
-                        $t->string($column, 100)->nullable();
-                        break;
-                    case 'string50':
-                        $t->string($column, 50)->nullable();
-                        break;
-                    case 'string30':
-                        $t->string($column, 30)->nullable();
-                        break;
-                    case 'string20':
-                        $t->string($column, 20)->nullable();
+                    case 'string255':
+                        $t->string($column, 255)->nullable();
                         break;
                     default:
                         $t->text($column)->nullable(); // Mudança: usar TEXT como padrão ao invés de string(50)
@@ -356,17 +420,8 @@ class ReceiveDataController extends Controller
                         $t->text($column)->nullable()->after('id');
                         break;
 
-                    case 'string100':
-                        $t->string($column, 100)->nullable()->after('id');
-                        break;
-                    case 'string50':
-                        $t->string($column, 50)->nullable()->after('id');
-                        break;
-                    case 'string30':
-                        $t->string($column, 30)->nullable()->after('id');
-                        break;
-                    case 'string20':
-                        $t->string($column, 20)->nullable()->after('id');
+                    case 'string255':
+                        $t->string($column, 255)->nullable()->after('id');
                         break;
                     default:
                         $t->text($column)->nullable()->after('id'); // Mudança: usar TEXT como padrão

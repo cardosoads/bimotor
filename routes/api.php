@@ -3,6 +3,7 @@
 use App\Http\Controllers\Api\LoginController;
 use App\Http\Controllers\Api\ReceiveDataController;
 use App\Models\User;
+use App\Models\Client;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Request;
 use Illuminate\Support\Facades\Route;
@@ -15,6 +16,18 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/me/identifier', function (\Illuminate\Http\Request $request) {
         return response()->json([
             'identifier' => $request->user()->identifier,
+        ]);
+    });
+    
+    // endpoint para listar clientes disponíveis
+    Route::get('/clients', function (\Illuminate\Http\Request $request) {
+        $clients = Client::select('id', 'name', 'database_name', 'email')
+            ->orderBy('name')
+            ->get();
+            
+        return response()->json([
+            'data' => $clients,
+            'total' => $clients->count()
         ]);
     });
 
